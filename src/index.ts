@@ -31,6 +31,7 @@ import {
   type InsightsIncrementalityDeps,
 } from './tools/insights-incrementality.js';
 import { ALL_KNOWN_WINDOWS } from './lib/attribution.js';
+import { resolveCredentials } from './credentials.js';
 
 /* ------------------------------------------------------------------------- */
 /* CLI flags                                                                 */
@@ -45,7 +46,9 @@ if (process.argv.includes('--help') || process.argv.includes('-h')) {
   process.stderr.write(`${pkg.name} v${pkg.version}\n\n`);
   process.stderr.write(`MCP server for Meta Marketing API incrementality reporting.\n`);
   process.stderr.write(`Communicates over stdio. Configure in your MCP client.\n\n`);
-  process.stderr.write(`Required env: META_ACCESS_TOKEN\n`);
+  process.stderr.write(`Auth (priority order):\n`);
+  process.stderr.write(`  1. META_ACCESS_TOKEN env var (System User token, recommended)\n`);
+  process.stderr.write(`  2. Cached OAuth token from: npx -p mcp-meta-ads-incrementality mcp-meta-ads-auth\n\n`);
   process.stderr.write(`Options:\n`);
   process.stderr.write(`  --help, -h     Show this help\n`);
   process.stderr.write(`  --version, -v  Show version\n`);
@@ -60,12 +63,17 @@ if (process.argv.includes('--version') || process.argv.includes('-v')) {
 /* Auth & client construction                                                */
 /* ------------------------------------------------------------------------- */
 
-const accessToken = (process.env.META_ACCESS_TOKEN ?? '').trim();
-if (!accessToken) {
-  process.stderr.write(
-    `[fatal] META_ACCESS_TOKEN environment variable is required.\n` +
-      `        Set it to a Meta Marketing API access token (System User token recommended).\n`,
-  );
+let accessToken: string;
+try {
+  const resolved = resolveCredentials();
+  accessToken = resolved.access_token;
+  process.stderr.write(`[startup] Auth: ${resolved.source === 'env' ? 'META_ACCESS_TOKEN env var' : 'cached OAuth token'}\n`);
+  if (resolved.expires_at) {
+    const daysLeft = Math.round((resolved.expires_at - Date.now() / 1000) / 86400);
+    process.stderr.write(`[startup] Token expires in ~${daysLeft} days\n`);
+  }
+} catch (err) {
+  process.stderr.write(`[fatal] ${(err as Error).message}\n`);
   process.exit(1);
 }
 

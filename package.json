@@ -1,10 +1,11 @@
 {
   "name": "mcp-meta-ads-incrementality",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "MCP server for Meta Marketing API focused on incrementality reporting. Surfaces Meta's incremental conversion attribution alongside default 7d-click/1d-view and dda windows so agencies can see the gap between reported and incremental performance.",
   "main": "dist/index.js",
   "bin": {
-    "mcp-meta-ads-incrementality": "dist/index.js"
+    "mcp-meta-ads-incrementality": "dist/index.js",
+    "mcp-meta-ads-auth": "dist/auth-cli.js"
   },
   "type": "module",
   "files": [
@@ -37,7 +38,9 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^0.5.0",
+    "env-paths": "^3.0.0",
     "facebook-nodejs-business-sdk": "^24.0.1",
+    "open": "^10.0.0",
     "zod": "^3.22.4"
   },
   "devDependencies": {
