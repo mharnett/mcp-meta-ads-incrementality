@@ -402,14 +402,9 @@ function randomState(): string {
   return Array.from(bytes).map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
-const isMain =
-  import.meta.url === `file://${process.argv[1]}` ||
-  process.argv[1]?.endsWith("/auth-cli.js") ||
-  process.argv[1]?.endsWith("\\auth-cli.js");
-
-if (isMain) {
-  run().catch((err) => {
-    process.stderr.write(`\n${err.message}\n`);
-    process.exit(1);
-  });
-}
+// Always run -- bin symlink name (mcp-meta-ads-auth) differs from file name
+// (auth-cli.js), so isMain checks fail under npx.
+run().catch((err) => {
+  process.stderr.write(`\n${err.message}\n`);
+  process.exit(1);
+});
