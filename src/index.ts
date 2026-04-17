@@ -32,6 +32,7 @@ import {
 } from './tools/insights-incrementality.js';
 import { ALL_KNOWN_WINDOWS } from './lib/attribution.js';
 import { resolveCredentials } from './credentials.js';
+import { safeResponse } from './safe-response.js';
 
 /* ------------------------------------------------------------------------- */
 /* CLI flags                                                                 */
@@ -166,7 +167,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case 'meta_ads_insights_incrementality': {
         const result = await runInsightsIncrementality(args, deps);
         return {
-          content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
+          content: [{ type: 'text', text: JSON.stringify(safeResponse(result, name), null, 2) }],
         };
       }
       default:
