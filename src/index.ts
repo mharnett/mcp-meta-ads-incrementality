@@ -30,6 +30,11 @@ import {
   runInsightsIncrementality,
   type InsightsIncrementalityDeps,
 } from './tools/insights-incrementality.js';
+import {
+  listAdsInCampaign,
+  getAdUrlTags,
+  updateAdUrlTags,
+} from './tools/url-tags.js';
 import { ALL_KNOWN_WINDOWS } from './lib/attribution.js';
 import { resolveCredentials } from './credentials.js';
 import { safeResponse } from './safe-response.js';
@@ -147,7 +152,70 @@ const TOOL_INSIGHTS_INCREMENTALITY = {
   },
 } as const;
 
-const TOOLS = [TOOL_INSIGHTS_INCREMENTALITY];
+const TOOL_LIST_ADS_IN_CAMPAIGN = {
+  name: 'meta_ads_list_ads_in_campaign',
+  description:
+    'List all ads in a Meta campaign with their id, name, status, and current creative_id. ' +
+    'Use as the discovery step before reading or updating url_tags across a campaign.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      campaign_id: { type: 'string', description: 'Meta campaign id (numeric).' },
+    },
+    required: ['campaign_id'],
+  },
+} as const;
+
+const TOOL_GET_AD_URL_TAGS = {
+  name: 'meta_ads_get_ad_url_tags',
+  description:
+    'Read the current url_tags (URL parameters) on a single Meta ad, plus the underlying ' +
+    'clickthrough link and creative_id. Use to inspect what utm tagging is in place today ' +
+    'before updating it.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      ad_id: { type: 'string', description: 'Meta ad id (numeric).' },
+    },
+    required: ['ad_id'],
+  },
+} as const;
+
+const TOOL_UPDATE_AD_URL_TAGS = {
+  name: 'meta_ads_update_ad_url_tags',
+  description:
+    'Update the url_tags (URL parameters) on a single Meta ad. The value should be a query-' +
+    'string fragment WITHOUT a leading ?, e.g. "utm_source=facebook&utm_campaign=foo&' +
+    'campaignid={{campaign.id}}". Note Meta uses double-brace macros ({{campaign.id}}, ' +
+    '{{ad.id}}, {{ad.name}}, etc.), not Google-Ads-style single braces. ' +
+    'Mechanism: POSTs a creative override to the ad, which forks a new creative under the ' +
+    'hood while keeping the ad_id stable. Pass dry_run=true to preview without writing. ' +
+    'Recommend testing on a PAUSED ad before touching active ones — Meta may briefly re-review.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      ad_id: { type: 'string', description: 'Meta ad id (numeric).' },
+      url_tags: {
+        type: 'string',
+        description:
+          'New url_tags value. Query-string fragment, no leading ?. Use {{campaign.id}} / ' +
+          '{{ad.id}} / {{ad.name}} for Meta dynamic macros.',
+      },
+      dry_run: {
+        type: 'boolean',
+        description: 'If true, return a diff without writing. Default false.',
+      },
+    },
+    required: ['ad_id', 'url_tags'],
+  },
+} as const;
+
+const TOOLS = [
+  TOOL_INSIGHTS_INCREMENTALITY,
+  TOOL_LIST_ADS_IN_CAMPAIGN,
+  TOOL_GET_AD_URL_TAGS,
+  TOOL_UPDATE_AD_URL_TAGS,
+];
 
 /* ------------------------------------------------------------------------- */
 /* Server                                                                    */
@@ -169,6 +237,29 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         return {
           content: [{ type: 'text', text: JSON.stringify(safeResponse(result, name), null, 2) }],
         };
+      }
+      case 'meta_ads_list_ads_in_campaign': {
+        const { campaign_id } = (args ?? {}) as { campaign_id?: string };
+        if (!campaign_id) throw new Error('campaign_id is required');
+        const result = await listAdsInCampaign(campaign_id, accessToken);
+        return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+      }
+      case 'meta_ads_get_ad_url_tags': {
+        const { ad_id } = (args ?? {}) as { ad_id?: string };
+        if (!ad_id) throw new Error('ad_id is required');
+        const result = await getAdUrlTags(ad_id, accessToken);
+        return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+      }
+      case 'meta_ads_update_ad_url_tags': {
+        const { ad_id, url_tags, dry_run } = (args ?? {}) as {
+          ad_id?: string;
+          url_tags?: string;
+          dry_run?: boolean;
+        };
+        if (!ad_id) throw new Error('ad_id is required');
+        if (typeof url_tags !== 'string') throw new Error('url_tags is required');
+        const result = await updateAdUrlTags(ad_id, url_tags, accessToken, Boolean(dry_run));
+        return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
       }
       default:
         return {
