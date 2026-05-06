@@ -34,6 +34,7 @@ import {
   listAdsInCampaign,
   getAdUrlTags,
   updateAdUrlTags,
+  renameAd,
 } from './tools/url-tags.js';
 import { ALL_KNOWN_WINDOWS } from './lib/attribution.js';
 import { resolveCredentials } from './credentials.js';
@@ -210,11 +211,32 @@ const TOOL_UPDATE_AD_URL_TAGS = {
   },
 } as const;
 
+const TOOL_RENAME_AD = {
+  name: 'meta_ads_rename_ad',
+  description:
+    'Rename a Meta ad. Useful before applying url_tags with the {{ad.name}} macro — ad ' +
+    'names with spaces produce literal spaces or %20 in the resulting URL. Pass dry_run=true ' +
+    'to preview without writing.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      ad_id: { type: 'string', description: 'Meta ad id (numeric).' },
+      new_name: { type: 'string', description: 'New ad name.' },
+      dry_run: {
+        type: 'boolean',
+        description: 'If true, return a diff without writing. Default false.',
+      },
+    },
+    required: ['ad_id', 'new_name'],
+  },
+} as const;
+
 const TOOLS = [
   TOOL_INSIGHTS_INCREMENTALITY,
   TOOL_LIST_ADS_IN_CAMPAIGN,
   TOOL_GET_AD_URL_TAGS,
   TOOL_UPDATE_AD_URL_TAGS,
+  TOOL_RENAME_AD,
 ];
 
 /* ------------------------------------------------------------------------- */
@@ -259,6 +281,17 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         if (!ad_id) throw new Error('ad_id is required');
         if (typeof url_tags !== 'string') throw new Error('url_tags is required');
         const result = await updateAdUrlTags(ad_id, url_tags, accessToken, Boolean(dry_run));
+        return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+      }
+      case 'meta_ads_rename_ad': {
+        const { ad_id, new_name, dry_run } = (args ?? {}) as {
+          ad_id?: string;
+          new_name?: string;
+          dry_run?: boolean;
+        };
+        if (!ad_id) throw new Error('ad_id is required');
+        if (typeof new_name !== 'string' || !new_name) throw new Error('new_name is required');
+        const result = await renameAd(ad_id, new_name, accessToken, Boolean(dry_run));
         return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
       }
       default:
