@@ -36,6 +36,7 @@ import {
   updateAdUrlTags,
   renameAd,
 } from './tools/url-tags.js';
+import { validateName } from './lib/naming-standards.js';
 import { ALL_KNOWN_WINDOWS } from './lib/attribution.js';
 import { resolveCredentials } from './credentials.js';
 import { safeResponse } from './safe-response.js';
@@ -215,7 +216,9 @@ const TOOL_RENAME_AD = {
   name: 'meta_ads_rename_ad',
   description:
     'Rename a Meta ad. Useful before applying url_tags with the {{ad.name}} macro — ad ' +
-    'names with spaces produce literal spaces or %20 in the resulting URL. Pass dry_run=true ' +
+    'names with spaces produce literal spaces or %20 in the resulting URL. The new name is ' +
+    'validated against shared naming standards (no spaces or URL-special characters); ' +
+    'violations block the write unless allow_naming_violations=true. Pass dry_run=true ' +
     'to preview without writing.',
   inputSchema: {
     type: 'object',
@@ -225,6 +228,10 @@ const TOOL_RENAME_AD = {
       dry_run: {
         type: 'boolean',
         description: 'If true, return a diff without writing. Default false.',
+      },
+      allow_naming_violations: {
+        type: 'boolean',
+        description: 'If true, bypass the naming-standards check. Default false.',
       },
     },
     required: ['ad_id', 'new_name'],
@@ -284,15 +291,32 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
       }
       case 'meta_ads_rename_ad': {
-        const { ad_id, new_name, dry_run } = (args ?? {}) as {
+        const { ad_id, new_name, dry_run, allow_naming_violations } = (args ?? {}) as {
           ad_id?: string;
           new_name?: string;
           dry_run?: boolean;
+          allow_naming_violations?: boolean;
         };
         if (!ad_id) throw new Error('ad_id is required');
         if (typeof new_name !== 'string' || !new_name) throw new Error('new_name is required');
+        const violations = validateName(new_name, 'ad');
+        if (violations.length > 0 && !allow_naming_violations) {
+          return {
+            isError: true,
+            content: [{
+              type: 'text',
+              text: `Naming standard violations on "${new_name}":\n` +
+                violations.map((v) => `  - ${v.rule}: ${v.detail}` +
+                  (v.suggested ? ` (suggest: "${v.suggested}")` : '')).join('\n') +
+                `\n\nPass allow_naming_violations=true to override.`,
+            }],
+          };
+        }
         const result = await renameAd(ad_id, new_name, accessToken, Boolean(dry_run));
-        return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+        const out = violations.length > 0
+          ? { ...result, naming_violations: violations }
+          : result;
+        return { content: [{ type: 'text', text: JSON.stringify(out, null, 2) }] };
       }
       default:
         return {
