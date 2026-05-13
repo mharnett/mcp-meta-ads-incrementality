@@ -36,6 +36,36 @@ import {
   updateAdUrlTags,
   renameAd,
 } from './tools/url-tags.js';
+import {
+  createCampaign,
+  createAdSet,
+  createAdCreative,
+  createAd,
+  uploadImage,
+  type CreateCampaignInput,
+  type CreateAdSetInput,
+  type CreateAdCreativeInput,
+  type CreateAdInput,
+  type UploadImageInput,
+} from './tools/campaign-build.js';
+import {
+  createLeadgenForm,
+  createCustomAudience,
+  uploadUsersToAudience,
+  createLookalikeAudience,
+  type CreateLeadgenFormInput,
+  type CreateCustomAudienceInput,
+  type UploadUsersToAudienceInput,
+  type CreateLookalikeAudienceInput,
+} from './tools/audiences-and-forms.js';
+import {
+  updateObjectStatus,
+  updateBudget,
+  deleteObject,
+  type UpdateObjectStatusInput,
+  type UpdateBudgetInput,
+  type DeleteObjectInput,
+} from './tools/lifecycle.js';
 import { validateName } from './lib/naming-standards.js';
 import { ALL_KNOWN_WINDOWS } from './lib/attribution.js';
 import { resolveCredentials } from './credentials.js';
@@ -238,12 +268,396 @@ const TOOL_RENAME_AD = {
   },
 } as const;
 
+/* ------------------------------------------------------------------------- */
+/* Tier 1 — campaign / ad set / creative / ad / image                        */
+/* ------------------------------------------------------------------------- */
+
+const TOOL_CREATE_CAMPAIGN = {
+  name: 'meta_ads_create_campaign',
+  description:
+    'Create a Meta ad campaign. Defaults to PAUSED status so the MCP cannot accidentally take ' +
+    'spend live. Set buying_type=AUCTION (default) for the standard auction model. CBO callers ' +
+    'pass daily_budget at the campaign level; ABO callers omit it and budget at the ad set level.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      account_id: { type: 'string', description: 'Ad account id (with or without act_ prefix).' },
+      name: { type: 'string' },
+      objective: {
+        type: 'string',
+        description: 'Meta objective enum, e.g. OUTCOME_LEADS, OUTCOME_TRAFFIC, OUTCOME_SALES.',
+      },
+      status: { type: 'string', enum: ['PAUSED', 'ACTIVE'], description: 'Default PAUSED.' },
+      special_ad_categories: {
+        type: 'array',
+        items: { type: 'string' },
+        description: 'e.g. ["HOUSING"]. Default [].',
+      },
+      buying_type: { type: 'string', enum: ['AUCTION', 'RESERVED'], description: 'Default AUCTION.' },
+      daily_budget: { type: 'number', description: 'Cents. Set only for CBO campaigns.' },
+      lifetime_budget: { type: 'number', description: 'Cents. Alternative to daily_budget.' },
+    },
+    required: ['account_id', 'name', 'objective'],
+  },
+} as const;
+
+const TOOL_CREATE_ADSET = {
+  name: 'meta_ads_create_adset',
+  description:
+    'Create a Meta ad set inside an existing campaign. Defaults to PAUSED. For ON_AD lead-gen ' +
+    'ad sets, pass destination_type="ON_AD" and promoted_object={page_id}. For OFFSITE ' +
+    'conversions, promoted_object={page_id, pixel_id, custom_event_type}. Pass is_incremental_' +
+    'attribution_enabled=true to switch to Meta\'s Incremental Conversions optimization (per ' +
+    'agency guidance). Budget required: daily_budget OR lifetime_budget (not both, not neither ' +
+    'unless inheriting from a CBO campaign).',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      account_id: { type: 'string' },
+      campaign_id: { type: 'string' },
+      name: { type: 'string' },
+      optimization_goal: {
+        type: 'string',
+        description: 'e.g. LEAD_GENERATION, OFFSITE_CONVERSIONS, LINK_CLICKS, REACH.',
+      },
+      billing_event: {
+        type: 'string',
+        enum: ['IMPRESSIONS', 'LINK_CLICKS', 'POST_ENGAGEMENT', 'THRUPLAY'],
+      },
+      bid_strategy: {
+        type: 'string',
+        enum: ['LOWEST_COST_WITHOUT_CAP', 'LOWEST_COST_WITH_BID_CAP', 'COST_CAP'],
+        description: 'Default LOWEST_COST_WITHOUT_CAP (Highest volume).',
+      },
+      bid_amount: { type: 'number', description: 'Cents. Required for COST_CAP / WITH_BID_CAP.' },
+      targeting: { type: 'object', description: 'Full Meta targeting spec.' },
+      status: { type: 'string', enum: ['PAUSED', 'ACTIVE'] },
+      daily_budget: { type: 'number', description: 'Cents.' },
+      lifetime_budget: { type: 'number', description: 'Cents.' },
+      promoted_object: { type: 'object' },
+      destination_type: { type: 'string', description: 'e.g. ON_AD, WEBSITE, APP, MESSENGER.' },
+      attribution_spec: {
+        type: 'array',
+        items: {
+          type: 'object',
+          properties: {
+            event_type: { type: 'string' },
+            window_days: { type: 'number' },
+          },
+          required: ['event_type', 'window_days'],
+        },
+      },
+      is_incremental_attribution_enabled: { type: 'boolean' },
+      start_time: { type: 'string' },
+      end_time: { type: 'string' },
+    },
+    required: ['account_id', 'campaign_id', 'name', 'optimization_goal', 'billing_event', 'targeting'],
+  },
+} as const;
+
+const TOOL_CREATE_AD_CREATIVE = {
+  name: 'meta_ads_create_ad_creative',
+  description:
+    'Create a Meta ad creative (object_story_spec.link_data style — single image). Pass ' +
+    'lead_gen_form_id to auto-wire the SIGN_UP CTA pointing at a Lead Form, or pass an explicit ' +
+    'call_to_action for non-LGF flows. Pair with meta_ads_upload_image to get an image_hash.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      account_id: { type: 'string' },
+      name: { type: 'string' },
+      page_id: { type: 'string' },
+      image_hash: { type: 'string', description: 'From meta_ads_upload_image.' },
+      link: { type: 'string', description: 'Clickthrough URL.' },
+      message: { type: 'string', description: 'Primary text shown above the image.' },
+      headline: { type: 'string', description: 'Optional bold headline below the image.' },
+      description: { type: 'string', description: 'Optional sub-description.' },
+      call_to_action: {
+        type: 'object',
+        properties: {
+          type: { type: 'string', description: 'e.g. SIGN_UP, DOWNLOAD, LEARN_MORE, SHOP_NOW.' },
+          value: {
+            type: 'object',
+            properties: {
+              link: { type: 'string' },
+              lead_gen_form_id: { type: 'string' },
+            },
+          },
+        },
+        required: ['type'],
+      },
+      lead_gen_form_id: {
+        type: 'string',
+        description: 'Shortcut: builds CTA={type:SIGN_UP, value:{lead_gen_form_id}}.',
+      },
+      url_tags: {
+        type: 'string',
+        description: 'Query-string fragment for tracking, no leading ?. Use {{ad.name}} macros.',
+      },
+      instagram_actor_id: {
+        type: 'string',
+        description: 'Optional IG business account for cross-posting.',
+      },
+    },
+    required: ['account_id', 'name', 'page_id', 'link', 'message'],
+  },
+} as const;
+
+const TOOL_CREATE_AD = {
+  name: 'meta_ads_create_ad',
+  description:
+    'Create a Meta ad attached to an ad set and creative. Defaults to PAUSED.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      account_id: { type: 'string' },
+      name: { type: 'string' },
+      adset_id: { type: 'string' },
+      creative_id: { type: 'string' },
+      status: { type: 'string', enum: ['PAUSED', 'ACTIVE'] },
+    },
+    required: ['account_id', 'name', 'adset_id', 'creative_id'],
+  },
+} as const;
+
+const TOOL_UPLOAD_IMAGE = {
+  name: 'meta_ads_upload_image',
+  description:
+    'Upload an image to an ad account and return its image_hash + CDN URL. Pass either ' +
+    'image_bytes (base64-encoded) or image_path (local file path; this MCP reads + encodes it).',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      account_id: { type: 'string' },
+      image_bytes: { type: 'string', description: 'Base64-encoded image data.' },
+      image_path: { type: 'string', description: 'Local file path to read.' },
+    },
+    required: ['account_id'],
+  },
+} as const;
+
+/* ------------------------------------------------------------------------- */
+/* Tier 2 — audiences + lead forms                                            */
+/* ------------------------------------------------------------------------- */
+
+const TOOL_CREATE_LEADGEN_FORM = {
+  name: 'meta_ads_create_leadgen_form',
+  description:
+    'Create a Meta lead-gen Instant Form on a Facebook Page. Requires Page-scoped permissions on ' +
+    'the access token; calls that fail with Graph error code 3 ("Application does not have the ' +
+    'capability to make this API call") indicate the app lacks Lead Ads management capability ' +
+    'and need an App Review fix, not a client-code change. Also requires the Page to have ' +
+    'accepted Facebook\'s Lead Generation Terms of Service (Page Settings → Lead Ads Terms) — ' +
+    'fails with subcode 1815089 if not.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      page_id: { type: 'string' },
+      name: { type: 'string' },
+      locale: { type: 'string', description: 'Default en_US.' },
+      form_type: { type: 'string', enum: ['MORE_VOLUME', 'HIGHER_INTENT'] },
+      block_display_for_non_targeted_viewer: { type: 'boolean' },
+      privacy_policy: {
+        type: 'object',
+        properties: { url: { type: 'string' }, link_text: { type: 'string' } },
+        required: ['url'],
+      },
+      context_card: {
+        type: 'object',
+        properties: {
+          style: { type: 'string', enum: ['PARAGRAPH_STYLE', 'LIST_STYLE'] },
+          title: { type: 'string' },
+          content: { type: 'array', items: { type: 'string' } },
+          button_text: { type: 'string' },
+        },
+        required: ['style', 'title', 'content'],
+      },
+      questions: {
+        type: 'array',
+        items: {
+          type: 'object',
+          properties: {
+            type: { type: 'string' },
+            key: { type: 'string' },
+            label: { type: 'string' },
+            options: {
+              type: 'array',
+              items: {
+                type: 'object',
+                properties: { value: { type: 'string' }, key: { type: 'string' } },
+                required: ['value', 'key'],
+              },
+            },
+          },
+          required: ['type'],
+        },
+      },
+      thank_you_page: {
+        type: 'object',
+        properties: {
+          title: { type: 'string' },
+          body: { type: 'string' },
+          button_text: { type: 'string' },
+          button_type: { type: 'string', enum: ['VIEW_WEBSITE', 'CALL_BUSINESS', 'MESSAGE_BUSINESS'] },
+          website_url: { type: 'string' },
+        },
+        required: ['title', 'body', 'button_text', 'button_type'],
+      },
+      follow_up_action_url: { type: 'string' },
+    },
+    required: ['page_id', 'name', 'privacy_policy', 'questions', 'thank_you_page'],
+  },
+} as const;
+
+const TOOL_CREATE_CUSTOM_AUDIENCE = {
+  name: 'meta_ads_create_custom_audience',
+  description:
+    'Create an empty Custom Audience on an ad account, ready to receive records via ' +
+    'meta_ads_upload_users_to_audience. Returns audience_id. Not usable in ad sets until at ' +
+    'least one user batch is uploaded and processed.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      account_id: { type: 'string' },
+      name: { type: 'string' },
+      description: { type: 'string' },
+      customer_file_source: {
+        type: 'string',
+        enum: ['USER_PROVIDED_ONLY', 'PARTNER_PROVIDED_ONLY', 'BOTH_USER_AND_PARTNER_PROVIDED'],
+      },
+    },
+    required: ['account_id', 'name'],
+  },
+} as const;
+
+const TOOL_UPLOAD_USERS_TO_AUDIENCE = {
+  name: 'meta_ads_upload_users_to_audience',
+  description:
+    'Upload user records to a Custom Audience. Records are SHA-256 hashed locally before send ' +
+    '(emails lowercased+trimmed; phones stripped to digits; names normalized to alphanumeric) — ' +
+    'pass plaintext, do not pre-hash. Schema is inferred from the first record (EMAIL or PHONE) ' +
+    'if not specified. Returns num_received and num_invalid_entries.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      audience_id: { type: 'string' },
+      users: {
+        type: 'array',
+        items: {
+          type: 'object',
+          properties: {
+            email: { type: 'string' },
+            phone: { type: 'string' },
+            first_name: { type: 'string' },
+            last_name: { type: 'string' },
+            country: { type: 'string' },
+            zip: { type: 'string' },
+            city: { type: 'string' },
+            state: { type: 'string' },
+          },
+        },
+      },
+      schema: {
+        type: 'array',
+        items: {
+          type: 'string',
+          enum: ['EMAIL', 'PHONE', 'FN', 'LN', 'COUNTRY', 'ZIP', 'CT', 'ST', 'DOBY', 'GEN', 'MADID'],
+        },
+      },
+      session_id: { type: 'number' },
+      batch_size: { type: 'number', description: 'Default 1000, max 10000.' },
+    },
+    required: ['audience_id', 'users'],
+  },
+} as const;
+
+const TOOL_CREATE_LOOKALIKE_AUDIENCE = {
+  name: 'meta_ads_create_lookalike_audience',
+  description:
+    'Create a Lookalike Audience seeded by an existing Custom Audience. Ratio is a fraction of ' +
+    'country population (0.01 = top 1%, highest similarity / smallest reach; 0.10 = broader). ' +
+    'Default 0.01. Range 0.01–0.20.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      account_id: { type: 'string' },
+      name: { type: 'string' },
+      origin_audience_id: { type: 'string' },
+      country: { type: 'string', description: 'ISO 3166-1 alpha-2.' },
+      ratio: { type: 'number' },
+      description: { type: 'string' },
+    },
+    required: ['account_id', 'name', 'origin_audience_id', 'country'],
+  },
+} as const;
+
+/* ------------------------------------------------------------------------- */
+/* Tier 3 + 4 — lifecycle                                                     */
+/* ------------------------------------------------------------------------- */
+
+const TOOL_UPDATE_OBJECT_STATUS = {
+  name: 'meta_ads_update_object_status',
+  description:
+    'Toggle the status of a campaign, ad set, or ad. Pass object_id of any of those types. ' +
+    'PAUSED stops spend; ACTIVE resumes; ARCHIVED removes from active views without deleting.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      object_id: { type: 'string', description: 'Campaign, ad set, or ad id.' },
+      status: { type: 'string', enum: ['PAUSED', 'ACTIVE', 'ARCHIVED'] },
+    },
+    required: ['object_id', 'status'],
+  },
+} as const;
+
+const TOOL_UPDATE_BUDGET = {
+  name: 'meta_ads_update_budget',
+  description:
+    'Update the daily or lifetime budget on a campaign or ad set. Pass exactly one of ' +
+    'daily_budget or lifetime_budget (in cents). For CBO campaigns, set on the campaign; for ' +
+    'ABO ad sets, set on each ad set.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      object_id: { type: 'string', description: 'Campaign or ad set id.' },
+      daily_budget: { type: 'number', description: 'Cents.' },
+      lifetime_budget: { type: 'number', description: 'Cents.' },
+    },
+    required: ['object_id'],
+  },
+} as const;
+
+const TOOL_DELETE_OBJECT = {
+  name: 'meta_ads_delete_object',
+  description:
+    'Permanently delete a Meta object (campaign, ad set, ad, creative, custom audience). ' +
+    'Irreversible — prefer meta_ads_update_object_status with status=ARCHIVED unless you truly ' +
+    'want to remove the object and its history.',
+  inputSchema: {
+    type: 'object',
+    properties: { object_id: { type: 'string' } },
+    required: ['object_id'],
+  },
+} as const;
+
 const TOOLS = [
   TOOL_INSIGHTS_INCREMENTALITY,
   TOOL_LIST_ADS_IN_CAMPAIGN,
   TOOL_GET_AD_URL_TAGS,
   TOOL_UPDATE_AD_URL_TAGS,
   TOOL_RENAME_AD,
+  TOOL_CREATE_CAMPAIGN,
+  TOOL_CREATE_ADSET,
+  TOOL_CREATE_AD_CREATIVE,
+  TOOL_CREATE_AD,
+  TOOL_UPLOAD_IMAGE,
+  TOOL_CREATE_LEADGEN_FORM,
+  TOOL_CREATE_CUSTOM_AUDIENCE,
+  TOOL_UPLOAD_USERS_TO_AUDIENCE,
+  TOOL_CREATE_LOOKALIKE_AUDIENCE,
+  TOOL_UPDATE_OBJECT_STATUS,
+  TOOL_UPDATE_BUDGET,
+  TOOL_DELETE_OBJECT,
 ];
 
 /* ------------------------------------------------------------------------- */
@@ -317,6 +731,54 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           ? { ...result, naming_violations: violations }
           : result;
         return { content: [{ type: 'text', text: JSON.stringify(out, null, 2) }] };
+      }
+      case 'meta_ads_create_campaign': {
+        const r = await createCampaign((args ?? {}) as unknown as CreateCampaignInput, accessToken);
+        return { content: [{ type: 'text', text: JSON.stringify(r, null, 2) }] };
+      }
+      case 'meta_ads_create_adset': {
+        const r = await createAdSet((args ?? {}) as unknown as CreateAdSetInput, accessToken);
+        return { content: [{ type: 'text', text: JSON.stringify(r, null, 2) }] };
+      }
+      case 'meta_ads_create_ad_creative': {
+        const r = await createAdCreative((args ?? {}) as unknown as CreateAdCreativeInput, accessToken);
+        return { content: [{ type: 'text', text: JSON.stringify(r, null, 2) }] };
+      }
+      case 'meta_ads_create_ad': {
+        const r = await createAd((args ?? {}) as unknown as CreateAdInput, accessToken);
+        return { content: [{ type: 'text', text: JSON.stringify(r, null, 2) }] };
+      }
+      case 'meta_ads_upload_image': {
+        const r = await uploadImage((args ?? {}) as unknown as UploadImageInput, accessToken);
+        return { content: [{ type: 'text', text: JSON.stringify(r, null, 2) }] };
+      }
+      case 'meta_ads_create_leadgen_form': {
+        const r = await createLeadgenForm((args ?? {}) as unknown as CreateLeadgenFormInput, accessToken);
+        return { content: [{ type: 'text', text: JSON.stringify(r, null, 2) }] };
+      }
+      case 'meta_ads_create_custom_audience': {
+        const r = await createCustomAudience((args ?? {}) as unknown as CreateCustomAudienceInput, accessToken);
+        return { content: [{ type: 'text', text: JSON.stringify(r, null, 2) }] };
+      }
+      case 'meta_ads_upload_users_to_audience': {
+        const r = await uploadUsersToAudience((args ?? {}) as unknown as UploadUsersToAudienceInput, accessToken);
+        return { content: [{ type: 'text', text: JSON.stringify(r, null, 2) }] };
+      }
+      case 'meta_ads_create_lookalike_audience': {
+        const r = await createLookalikeAudience((args ?? {}) as unknown as CreateLookalikeAudienceInput, accessToken);
+        return { content: [{ type: 'text', text: JSON.stringify(r, null, 2) }] };
+      }
+      case 'meta_ads_update_object_status': {
+        const r = await updateObjectStatus((args ?? {}) as unknown as UpdateObjectStatusInput, accessToken);
+        return { content: [{ type: 'text', text: JSON.stringify(r, null, 2) }] };
+      }
+      case 'meta_ads_update_budget': {
+        const r = await updateBudget((args ?? {}) as unknown as UpdateBudgetInput, accessToken);
+        return { content: [{ type: 'text', text: JSON.stringify(r, null, 2) }] };
+      }
+      case 'meta_ads_delete_object': {
+        const r = await deleteObject((args ?? {}) as unknown as DeleteObjectInput, accessToken);
+        return { content: [{ type: 'text', text: JSON.stringify(r, null, 2) }] };
       }
       default:
         return {

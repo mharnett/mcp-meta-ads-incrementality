@@ -18,61 +18,7 @@
  *   3. POST /{ad-id} with creative_id=<new> to rebind.
  * The ad-id is unchanged. Meta may briefly re-review the ad.
  */
-const GRAPH_VERSION = 'v22.0';
-const GRAPH_BASE = `https://graph.facebook.com/${GRAPH_VERSION}`;
-
-interface GraphErrorBody {
-  error?: {
-    message?: string;
-    type?: string;
-    code?: number;
-    error_subcode?: number;
-    error_user_title?: string;
-    error_user_msg?: string;
-    fbtrace_id?: string;
-  };
-}
-
-function formatGraphError(err: GraphErrorBody['error'] | undefined, fallback: string): string {
-  if (!err) return fallback;
-  const parts = [
-    err.message ?? fallback,
-    err.code !== undefined ? `code=${err.code}` : null,
-    err.error_subcode !== undefined ? `subcode=${err.error_subcode}` : null,
-    err.error_user_title ? `title="${err.error_user_title}"` : null,
-    err.error_user_msg ? `user_msg="${err.error_user_msg}"` : null,
-    err.fbtrace_id ? `trace=${err.fbtrace_id}` : null,
-  ].filter(Boolean);
-  return parts.join(' | ');
-}
-
-async function graphGet<T>(path: string, accessToken: string, params: Record<string, string> = {}): Promise<T> {
-  const url = new URL(`${GRAPH_BASE}/${path}`);
-  for (const [k, v] of Object.entries(params)) url.searchParams.set(k, v);
-  url.searchParams.set('access_token', accessToken);
-  const res = await fetch(url.toString());
-  const body = await res.json() as T & GraphErrorBody;
-  if (!res.ok || body.error) {
-    throw new Error(`Meta Graph GET ${path} failed: ${formatGraphError(body.error, `HTTP ${res.status}`)}`);
-  }
-  return body;
-}
-
-async function graphPost<T>(path: string, accessToken: string, body: Record<string, string>): Promise<T> {
-  const form = new URLSearchParams();
-  for (const [k, v] of Object.entries(body)) form.set(k, v);
-  form.set('access_token', accessToken);
-  const res = await fetch(`${GRAPH_BASE}/${path}`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: form.toString(),
-  });
-  const json = await res.json() as T & GraphErrorBody;
-  if (!res.ok || json.error) {
-    throw new Error(`Meta Graph POST ${path} failed: ${formatGraphError(json.error, `HTTP ${res.status}`)}`);
-  }
-  return json;
-}
+import { graphGet, graphPost } from '../lib/graph.js';
 
 /* ------------------------------------------------------------------------- */
 /* List ads in a campaign                                                    */
