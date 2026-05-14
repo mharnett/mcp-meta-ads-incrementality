@@ -290,6 +290,244 @@ export async function updateAdUrlTags(
 }
 
 /* ------------------------------------------------------------------------- */
+/* Swap lead form on an ad                                                   */
+/* ------------------------------------------------------------------------- */
+
+export interface SwapAdLeadFormResult {
+  ad_id: string;
+  ad_name: string;
+  previous_creative_id: string;
+  new_creative_id: string;
+  previous_form_id: string | null;
+  new_form_id: string;
+  mode: 'asset_feed_spec' | 'object_story_spec';
+  changed: boolean;
+}
+
+interface CreativeReadFull {
+  id: string;
+  name?: string;
+  url_tags?: string;
+  object_story_id?: string;
+  effective_object_story_id?: string;
+  object_story_spec?: {
+    page_id?: string;
+    instagram_actor_id?: string;
+    link_data?: {
+      link?: string;
+      message?: string;
+      name?: string;
+      description?: string;
+      image_hash?: string;
+      call_to_action?: { type?: string; value?: { lead_gen_form_id?: string; link?: string } };
+    };
+  };
+  asset_feed_spec?: {
+    images?: Array<{ hash?: string }>;
+    bodies?: Array<{ text?: string }>;
+    titles?: Array<{ text?: string }>;
+    descriptions?: Array<{ text?: string }>;
+    link_urls?: Array<{ website_url?: string }>;
+    call_to_action_types?: string[];
+    call_to_actions?: Array<{ type?: string; value?: { lead_gen_form_id?: string } }>;
+    ad_formats?: string[];
+  };
+}
+
+interface AdReadForSwap {
+  id: string;
+  name: string;
+  account_id?: string;
+  creative?: CreativeReadFull;
+}
+
+/**
+ * Swap the lead form on an ad by rebuilding its creative with a new form_id.
+ *
+ * Meta creatives are immutable, so we create-then-rebind:
+ *  1. Read the ad's current creative (full spec — handles both legacy
+ *     object_story_spec and modern asset_feed_spec creatives).
+ *  2. POST /act_X/adcreatives with the same image/text spec but new
+ *     lead_gen_form_id inside the SIGN_UP CTA.
+ *  3. POST /{ad-id} with creative_id=<new> to rebind.
+ *
+ * The ad-id is unchanged. Meta may briefly re-review.
+ */
+export async function swapAdLeadForm(
+  adId: string,
+  newFormId: string,
+  accessToken: string,
+  dryRun: boolean,
+  ctaTypeOverride?: string,
+): Promise<SwapAdLeadFormResult> {
+  const fields =
+    'id,name,account_id,creative{' +
+      'id,name,url_tags,object_story_id,effective_object_story_id,' +
+      'object_story_spec{page_id,link_data{link,message,name,description,image_hash,call_to_action}},' +
+      'asset_feed_spec{images,bodies,titles,descriptions,link_urls,call_to_action_types,call_to_actions,ad_formats}' +
+    '}';
+  const ad = await graphGet<AdReadForSwap>(adId, accessToken, { fields });
+
+  const creative = ad.creative;
+  if (!creative) throw new Error(`Ad ${adId}: no creative attached.`);
+  if (!ad.account_id) throw new Error(`Ad ${adId}: response missing account_id.`);
+
+  const previousFormId =
+    creative.object_story_spec?.link_data?.call_to_action?.value?.lead_gen_form_id ??
+    creative.asset_feed_spec?.call_to_actions?.[0]?.value?.lead_gen_form_id ??
+    null;
+
+  const existingCtaType =
+    creative.object_story_spec?.link_data?.call_to_action?.type ??
+    creative.asset_feed_spec?.call_to_actions?.[0]?.type ??
+    null;
+  const ctaType = ctaTypeOverride ?? existingCtaType ?? 'SIGN_UP';
+
+  const isAssetFeed = !!creative.asset_feed_spec && (creative.asset_feed_spec.bodies?.length ?? 0) > 0;
+  const mode: 'asset_feed_spec' | 'object_story_spec' = isAssetFeed ? 'asset_feed_spec' : 'object_story_spec';
+
+  if (dryRun) {
+    return {
+      ad_id: ad.id,
+      ad_name: ad.name,
+      previous_creative_id: creative.id,
+      new_creative_id: '',
+      previous_form_id: previousFormId,
+      new_form_id: newFormId,
+      mode,
+      changed: previousFormId !== newFormId,
+    };
+  }
+
+  if (previousFormId === newFormId) {
+    return {
+      ad_id: ad.id,
+      ad_name: ad.name,
+      previous_creative_id: creative.id,
+      new_creative_id: creative.id,
+      previous_form_id: previousFormId,
+      new_form_id: newFormId,
+      mode,
+      changed: false,
+    };
+  }
+
+  const acct = ad.account_id.startsWith('act_') ? ad.account_id : `act_${ad.account_id}`;
+  const newCta = { type: ctaType, value: { lead_gen_form_id: newFormId } };
+  const body: Record<string, string> = {
+    name: `${creative.name ?? ad.name} — form-swap ${new Date().toISOString().slice(0, 10)}`,
+  };
+  if (creative.url_tags) body.url_tags = creative.url_tags;
+
+  if (isAssetFeed) {
+    const afs = creative.asset_feed_spec!;
+    const rebuilt: Record<string, unknown> = {
+      images: afs.images ?? [],
+      bodies: afs.bodies ?? [],
+      link_urls: afs.link_urls ?? [],
+      ad_formats: afs.ad_formats ?? ['SINGLE_IMAGE'],
+      call_to_action_types: [ctaType],
+      call_to_actions: [newCta],
+    };
+    if (afs.titles?.length) rebuilt.titles = afs.titles;
+    if (afs.descriptions?.length) rebuilt.descriptions = afs.descriptions;
+
+    const oss = creative.object_story_spec;
+    const ossOut: Record<string, unknown> = { page_id: oss?.page_id };
+    if (oss?.instagram_actor_id) ossOut.instagram_actor_id = oss.instagram_actor_id;
+
+    body.object_story_spec = JSON.stringify(ossOut);
+    body.asset_feed_spec = JSON.stringify(rebuilt);
+  } else {
+    const oss = creative.object_story_spec;
+    const ld = oss?.link_data;
+    if (!oss?.page_id || !ld?.link || !ld?.message) {
+      throw new Error(
+        `Ad ${adId} creative ${creative.id}: legacy creative missing page_id/link/message — cannot rebuild for form swap.`,
+      );
+    }
+    const linkData: Record<string, unknown> = {
+      link: ld.link,
+      message: ld.message,
+      call_to_action: newCta,
+    };
+    if (ld.image_hash) linkData.image_hash = ld.image_hash;
+    if (ld.name) linkData.name = ld.name;
+    if (ld.description) linkData.description = ld.description;
+
+    const ossOut: Record<string, unknown> = { page_id: oss.page_id, link_data: linkData };
+    if (oss.instagram_actor_id) ossOut.instagram_actor_id = oss.instagram_actor_id;
+    body.object_story_spec = JSON.stringify(ossOut);
+  }
+
+  const created = await graphPost<CreativeCreateResponse>(`${acct}/adcreatives`, accessToken, body);
+  await graphPost<AdUpdateResponse>(adId, accessToken, {
+    creative: JSON.stringify({ creative_id: created.id }),
+  });
+
+  return {
+    ad_id: ad.id,
+    ad_name: ad.name,
+    previous_creative_id: creative.id,
+    new_creative_id: created.id,
+    previous_form_id: previousFormId,
+    new_form_id: newFormId,
+    mode,
+    changed: true,
+  };
+}
+
+/* ------------------------------------------------------------------------- */
+/* Rebind an ad to a different creative                                      */
+/* ------------------------------------------------------------------------- */
+
+export interface RebindAdCreativeResult {
+  ad_id: string;
+  ad_name: string;
+  previous_creative_id: string;
+  new_creative_id: string;
+  changed: boolean;
+}
+
+/**
+ * Rebind an ad to a different creative_id. Atomic. ad_id stays stable.
+ * Use with createAdCreative to do full ad rebuilds (e.g. swap form + rebuild
+ * text content) without touching the ad_id.
+ */
+export async function rebindAdCreative(
+  adId: string,
+  newCreativeId: string,
+  accessToken: string,
+  dryRun: boolean,
+): Promise<RebindAdCreativeResult> {
+  const before = await graphGet<{ id: string; name: string; creative?: { id: string } }>(
+    adId,
+    accessToken,
+    { fields: 'id,name,creative{id}' },
+  );
+  const previousId = before.creative?.id ?? '';
+  if (dryRun || previousId === newCreativeId) {
+    return {
+      ad_id: before.id,
+      ad_name: before.name,
+      previous_creative_id: previousId,
+      new_creative_id: newCreativeId,
+      changed: previousId !== newCreativeId && !dryRun,
+    };
+  }
+  await graphPost<AdUpdateResponse>(adId, accessToken, {
+    creative: JSON.stringify({ creative_id: newCreativeId }),
+  });
+  return {
+    ad_id: before.id,
+    ad_name: before.name,
+    previous_creative_id: previousId,
+    new_creative_id: newCreativeId,
+    changed: true,
+  };
+}
+
+/* ------------------------------------------------------------------------- */
 /* Rename ad                                                                 */
 /* ------------------------------------------------------------------------- */
 

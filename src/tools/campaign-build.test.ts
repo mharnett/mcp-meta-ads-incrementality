@@ -339,6 +339,78 @@ describe('createAdCreative', () => {
     setupFetchMock([{ _status: 400, _body: { error: { code: 100, message: 'bad image' } } }]);
     await expect(createAdCreative(base, TOKEN)).rejects.toThrow(/bad image/);
   });
+
+  it('legacy single-string mode reports mode=object_story_spec', async () => {
+    setupFetchMock([{ id: 'cr_legacy' }]);
+    const r = await createAdCreative(base, TOKEN);
+    expect(r.mode).toBe('object_story_spec');
+  });
+
+  it('switches to asset_feed_spec (DEGREES_OF_FREEDOM) when messages[] has >1 entry', async () => {
+    const { calls } = setupFetchMock([{ id: 'cr_afs' }]);
+    const r = await createAdCreative(
+      {
+        ...base,
+        message: undefined,
+        messages: ['Body A', 'Body B', 'Body C'],
+        headlines: ['Title X', 'Title Y'],
+        descriptions: ['Desc 1', 'Desc 2'],
+        lead_gen_form_id: 'form_777',
+      } as Parameters<typeof createAdCreative>[0],
+      TOKEN,
+    );
+    expect(r.mode).toBe('asset_feed_spec');
+    const body = calls[0]!.body;
+    const afs = JSON.parse(body.get('asset_feed_spec')!);
+    expect(afs.optimization_type).toBe('DEGREES_OF_FREEDOM');
+    expect(afs.bodies).toEqual([{ text: 'Body A' }, { text: 'Body B' }, { text: 'Body C' }]);
+    expect(afs.titles).toEqual([{ text: 'Title X' }, { text: 'Title Y' }]);
+    expect(afs.descriptions).toEqual([{ text: 'Desc 1' }, { text: 'Desc 2' }]);
+    // Per Meta's actual accepted shape (learned from a UI-built ad 2026-05-14):
+    // image_hash + CTA + link live in object_story_spec.link_data, not asset_feed_spec.
+    expect(afs.images).toBeUndefined();
+    expect(afs.link_urls).toBeUndefined();
+    expect(afs.call_to_actions).toBeUndefined();
+    expect(afs.call_to_action_types).toBeUndefined();
+    expect(afs.ad_formats).toBeUndefined();
+    const oss = JSON.parse(body.get('object_story_spec')!);
+    expect(oss.page_id).toBe('111');
+    expect(oss.link_data.link).toBe('https://example.com/lp');
+    expect(oss.link_data.image_hash).toBe('hash_abc');
+    expect(oss.link_data.call_to_action).toEqual({
+      type: 'SIGN_UP',
+      value: { lead_gen_form_id: 'form_777' },
+    });
+  });
+
+  it('rejects asset_feed_spec mode without image_hash', async () => {
+    setupFetchMock([{ id: 'x' }]);
+    await expect(
+      createAdCreative(
+        {
+          ...base,
+          image_hash: undefined,
+          message: undefined,
+          messages: ['A', 'B'],
+        } as Parameters<typeof createAdCreative>[0],
+        TOKEN,
+      ),
+    ).rejects.toThrow(/image_hash/);
+  });
+
+  it('caps variants at 5', async () => {
+    setupFetchMock([{ id: 'x' }]);
+    await expect(
+      createAdCreative(
+        {
+          ...base,
+          message: undefined,
+          messages: ['1', '2', '3', '4', '5', '6'],
+        } as Parameters<typeof createAdCreative>[0],
+        TOKEN,
+      ),
+    ).rejects.toThrow(/5/);
+  });
 });
 
 /* ========================================================================= */

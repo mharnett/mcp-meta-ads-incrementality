@@ -35,6 +35,8 @@ import {
   getAdUrlTags,
   updateAdUrlTags,
   renameAd,
+  swapAdLeadForm,
+  rebindAdCreative,
 } from './tools/url-tags.js';
 import {
   createCampaign,
@@ -358,20 +360,37 @@ const TOOL_CREATE_ADSET = {
 const TOOL_CREATE_AD_CREATIVE = {
   name: 'meta_ads_create_ad_creative',
   description:
-    'Create a Meta ad creative (object_story_spec.link_data style — single image). Pass ' +
-    'lead_gen_form_id to auto-wire the SIGN_UP CTA pointing at a Lead Form, or pass an explicit ' +
-    'call_to_action for non-LGF flows. Pair with meta_ads_upload_image to get an image_hash.',
+    'Create a Meta ad creative (single image). Two modes: (1) legacy object_story_spec ' +
+    'when message/headline/description are single strings; (2) asset_feed_spec / Flexible Ads ' +
+    'when any of messages[]/headlines[]/descriptions[] has >1 entry — Meta then mix-and-matches ' +
+    'variants per impression (cap 5 each). Pass lead_gen_form_id to auto-wire the SIGN_UP CTA. ' +
+    'Pair with meta_ads_upload_image to get an image_hash.',
   inputSchema: {
     type: 'object',
     properties: {
       account_id: { type: 'string' },
       name: { type: 'string' },
       page_id: { type: 'string' },
-      image_hash: { type: 'string', description: 'From meta_ads_upload_image.' },
+      image_hash: { type: 'string', description: 'From meta_ads_upload_image. Required for both single and asset_feed_spec modes.' },
       link: { type: 'string', description: 'Clickthrough URL.' },
-      message: { type: 'string', description: 'Primary text shown above the image.' },
-      headline: { type: 'string', description: 'Optional bold headline below the image.' },
-      description: { type: 'string', description: 'Optional sub-description.' },
+      message: { type: 'string', description: 'Single primary text. Mutually exclusive with messages[].' },
+      messages: {
+        type: 'array',
+        items: { type: 'string' },
+        description: 'Up to 5 primary text variants. Triggers asset_feed_spec mode if >1.',
+      },
+      headline: { type: 'string', description: 'Single headline below the image.' },
+      headlines: {
+        type: 'array',
+        items: { type: 'string' },
+        description: 'Up to 5 headline variants. Triggers asset_feed_spec mode if >1.',
+      },
+      description: { type: 'string', description: 'Single sub-description.' },
+      descriptions: {
+        type: 'array',
+        items: { type: 'string' },
+        description: 'Up to 5 description variants. Triggers asset_feed_spec mode if >1.',
+      },
       call_to_action: {
         type: 'object',
         properties: {
@@ -399,7 +418,7 @@ const TOOL_CREATE_AD_CREATIVE = {
         description: 'Optional IG business account for cross-posting.',
       },
     },
-    required: ['account_id', 'name', 'page_id', 'link', 'message'],
+    required: ['account_id', 'name', 'page_id', 'link'],
   },
 } as const;
 
@@ -640,12 +659,56 @@ const TOOL_DELETE_OBJECT = {
   },
 } as const;
 
+const TOOL_SWAP_AD_LEAD_FORM = {
+  name: 'meta_ads_swap_ad_lead_form',
+  description:
+    'Swap the lead form on an existing Meta ad by rebuilding its creative with a new ' +
+    'lead_gen_form_id, then rebinding the ad. Ad_id stays stable. Handles both legacy ' +
+    'object_story_spec creatives and modern asset_feed_spec (Flexible Ads) creatives — ' +
+    'preserves all image/text content, only the SIGN_UP CTA form_id changes. Pass dry_run=true ' +
+    'to preview. Meta may briefly re-review the ad after the swap.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      ad_id: { type: 'string', description: 'Meta ad id (numeric).' },
+      new_form_id: { type: 'string', description: 'New lead_gen_form_id to bind.' },
+      cta_type: {
+        type: 'string',
+        description:
+          'Override the CTA button type (e.g. DOWNLOAD, SIGN_UP, LEARN_MORE, GET_OFFER). ' +
+          'If omitted, preserves the existing CTA type from the ad\'s current creative.',
+      },
+      dry_run: { type: 'boolean', description: 'If true, return a diff without writing. Default false.' },
+    },
+    required: ['ad_id', 'new_form_id'],
+  },
+} as const;
+
+const TOOL_REBIND_AD_CREATIVE = {
+  name: 'meta_ads_rebind_ad_creative',
+  description:
+    'Rebind an ad to a different creative_id. ad_id stays stable. Use together with ' +
+    'meta_ads_create_ad_creative to do full ad rebuilds (e.g. swap form + rebuild text content) ' +
+    'without losing performance history on the ad object. Pass dry_run=true to preview.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      ad_id: { type: 'string', description: 'Meta ad id (numeric).' },
+      creative_id: { type: 'string', description: 'New creative_id to bind to the ad.' },
+      dry_run: { type: 'boolean', description: 'If true, return a diff without writing. Default false.' },
+    },
+    required: ['ad_id', 'creative_id'],
+  },
+} as const;
+
 const TOOLS = [
   TOOL_INSIGHTS_INCREMENTALITY,
   TOOL_LIST_ADS_IN_CAMPAIGN,
   TOOL_GET_AD_URL_TAGS,
   TOOL_UPDATE_AD_URL_TAGS,
   TOOL_RENAME_AD,
+  TOOL_SWAP_AD_LEAD_FORM,
+  TOOL_REBIND_AD_CREATIVE,
   TOOL_CREATE_CAMPAIGN,
   TOOL_CREATE_ADSET,
   TOOL_CREATE_AD_CREATIVE,
@@ -731,6 +794,29 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           ? { ...result, naming_violations: violations }
           : result;
         return { content: [{ type: 'text', text: JSON.stringify(out, null, 2) }] };
+      }
+      case 'meta_ads_swap_ad_lead_form': {
+        const { ad_id, new_form_id, cta_type, dry_run } = (args ?? {}) as {
+          ad_id?: string;
+          new_form_id?: string;
+          cta_type?: string;
+          dry_run?: boolean;
+        };
+        if (!ad_id) throw new Error('ad_id is required');
+        if (typeof new_form_id !== 'string' || !new_form_id) throw new Error('new_form_id is required');
+        const result = await swapAdLeadForm(ad_id, new_form_id, accessToken, Boolean(dry_run), cta_type);
+        return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+      }
+      case 'meta_ads_rebind_ad_creative': {
+        const { ad_id, creative_id, dry_run } = (args ?? {}) as {
+          ad_id?: string;
+          creative_id?: string;
+          dry_run?: boolean;
+        };
+        if (!ad_id) throw new Error('ad_id is required');
+        if (typeof creative_id !== 'string' || !creative_id) throw new Error('creative_id is required');
+        const result = await rebindAdCreative(ad_id, creative_id, accessToken, Boolean(dry_run));
+        return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
       }
       case 'meta_ads_create_campaign': {
         const r = await createCampaign((args ?? {}) as unknown as CreateCampaignInput, accessToken);

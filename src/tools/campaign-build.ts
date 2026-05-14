@@ -150,9 +150,18 @@ export interface CreateAdCreativeInput {
   page_id: string;
   image_hash?: string;
   link: string;
-  message: string;
+  /** Single primary text. Mutually exclusive with `messages`. */
+  message?: string;
+  /** Up to 5 primary texts (Flexible Ads / asset_feed_spec). */
+  messages?: string[];
+  /** Single headline. Mutually exclusive with `headlines`. */
   headline?: string;
+  /** Up to 5 headlines. */
+  headlines?: string[];
+  /** Single description. Mutually exclusive with `descriptions`. */
   description?: string;
+  /** Up to 5 descriptions. */
+  descriptions?: string[];
   call_to_action?: CallToAction;
   /** Shortcut: builds call_to_action={type:'SIGN_UP', value:{lead_gen_form_id}}. */
   lead_gen_form_id?: string;
@@ -165,6 +174,15 @@ export interface CreateAdCreativeResult {
   creative_id: string;
   account_id: string;
   name: string;
+  /** Whether the creative used asset_feed_spec (multi-variant) or legacy object_story_spec. */
+  mode: 'asset_feed_spec' | 'object_story_spec';
+}
+
+function collectVariants(single?: string, multi?: string[]): string[] {
+  const out: string[] = [];
+  if (multi && multi.length) out.push(...multi);
+  else if (single) out.push(single);
+  return out;
 }
 
 export async function createAdCreative(
@@ -173,34 +191,85 @@ export async function createAdCreative(
 ): Promise<CreateAdCreativeResult> {
   const account = normalizeAccountId(input.account_id);
 
+  const messages = collectVariants(input.message, input.messages);
+  const headlines = collectVariants(input.headline, input.headlines);
+  const descriptions = collectVariants(input.description, input.descriptions);
+
+  if (messages.length === 0) {
+    throw new Error('createAdCreative: provide message or messages[].');
+  }
+  if (messages.length > 5 || headlines.length > 5 || descriptions.length > 5) {
+    throw new Error('createAdCreative: Meta caps primary texts / headlines / descriptions at 5 each.');
+  }
+
   const callToAction: CallToAction | undefined = input.call_to_action ??
     (input.lead_gen_form_id
       ? { type: 'SIGN_UP', value: { lead_gen_form_id: input.lead_gen_form_id } }
       : undefined);
 
-  const linkData: Record<string, unknown> = {
-    link: input.link,
-    message: input.message,
-  };
-  if (input.image_hash) linkData.image_hash = input.image_hash;
-  if (input.headline) linkData.name = input.headline;
-  if (input.description) linkData.description = input.description;
-  if (callToAction) linkData.call_to_action = callToAction;
+  const useAssetFeedSpec =
+    messages.length > 1 || headlines.length > 1 || descriptions.length > 1;
 
-  const objectStorySpec: Record<string, unknown> = {
-    page_id: input.page_id,
-    link_data: linkData,
-  };
-  if (input.instagram_actor_id) objectStorySpec.instagram_actor_id = input.instagram_actor_id;
-
-  const body: Record<string, string> = {
-    name: input.name,
-    object_story_spec: JSON.stringify(objectStorySpec),
-  };
+  const body: Record<string, string> = { name: input.name };
   if (input.url_tags) body.url_tags = input.url_tags;
 
+  if (useAssetFeedSpec) {
+    // Meta "Flexible Ads" / multi-variant mode (optimization_type=DEGREES_OF_FREEDOM).
+    // Shape learned from a UI-built ad on 2026-05-14:
+    //   - image_hash + CTA + link live in object_story_spec.link_data (NOT in asset_feed_spec)
+    //   - asset_feed_spec contains ONLY bodies/titles/descriptions + optimization_type
+    //   - No images[], link_urls, call_to_action_types, call_to_actions, ad_formats in asset_feed_spec
+    if (!input.image_hash) {
+      throw new Error('createAdCreative: asset_feed_spec (multi-variant) mode requires image_hash.');
+    }
+
+    const linkData: Record<string, unknown> = {
+      link: input.link,
+      image_hash: input.image_hash,
+    };
+    if (callToAction) linkData.call_to_action = callToAction;
+
+    const objectStorySpec: Record<string, unknown> = {
+      page_id: input.page_id,
+      link_data: linkData,
+    };
+    if (input.instagram_actor_id) objectStorySpec.instagram_actor_id = input.instagram_actor_id;
+
+    const assetFeedSpec: Record<string, unknown> = {
+      bodies: messages.map((text) => ({ text })),
+      optimization_type: 'DEGREES_OF_FREEDOM',
+    };
+    if (headlines.length) assetFeedSpec.titles = headlines.map((text) => ({ text }));
+    if (descriptions.length) assetFeedSpec.descriptions = descriptions.map((text) => ({ text }));
+
+    body.object_story_spec = JSON.stringify(objectStorySpec);
+    body.asset_feed_spec = JSON.stringify(assetFeedSpec);
+  } else {
+    const linkData: Record<string, unknown> = {
+      link: input.link,
+      message: messages[0],
+    };
+    if (input.image_hash) linkData.image_hash = input.image_hash;
+    if (headlines.length) linkData.name = headlines[0];
+    if (descriptions.length) linkData.description = descriptions[0];
+    if (callToAction) linkData.call_to_action = callToAction;
+
+    const objectStorySpec: Record<string, unknown> = {
+      page_id: input.page_id,
+      link_data: linkData,
+    };
+    if (input.instagram_actor_id) objectStorySpec.instagram_actor_id = input.instagram_actor_id;
+
+    body.object_story_spec = JSON.stringify(objectStorySpec);
+  }
+
   const res = await graphPost<{ id: string }>(`${account}/adcreatives`, accessToken, body);
-  return { creative_id: res.id, account_id: account, name: input.name };
+  return {
+    creative_id: res.id,
+    account_id: account,
+    name: input.name,
+    mode: useAssetFeedSpec ? 'asset_feed_spec' : 'object_story_spec',
+  };
 }
 
 /* ------------------------------------------------------------------------- */
