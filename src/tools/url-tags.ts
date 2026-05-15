@@ -331,7 +331,30 @@ interface CreativeReadFull {
     call_to_action_types?: string[];
     call_to_actions?: Array<{ type?: string; value?: { lead_gen_form_id?: string } }>;
     ad_formats?: string[];
+    asset_customization_rules?: unknown[];
   };
+}
+
+/**
+ * Fetch asset_customization_rules for a creative. Returns the raw array (may be
+ * empty/undefined). Used by the rebind safety check — these are the per-placement
+ * image rules that get silently dropped if the create-then-rebind path doesn't
+ * carry them through.
+ */
+async function fetchCustomizationRules(
+  creativeId: string,
+  accessToken: string,
+): Promise<unknown[]> {
+  try {
+    const r = await graphGet<{ asset_feed_spec?: { asset_customization_rules?: unknown[] } }>(
+      creativeId,
+      accessToken,
+      { fields: 'asset_feed_spec{asset_customization_rules}' },
+    );
+    return r.asset_feed_spec?.asset_customization_rules ?? [];
+  } catch {
+    return [];
+  }
 }
 
 interface AdReadForSwap {
@@ -364,7 +387,7 @@ export async function swapAdLeadForm(
     'id,name,account_id,creative{' +
       'id,name,url_tags,object_story_id,effective_object_story_id,' +
       'object_story_spec{page_id,link_data{link,message,name,description,image_hash,call_to_action}},' +
-      'asset_feed_spec{images,bodies,titles,descriptions,link_urls,call_to_action_types,call_to_actions,ad_formats}' +
+      'asset_feed_spec{images,bodies,titles,descriptions,link_urls,call_to_action_types,call_to_actions,ad_formats,asset_customization_rules}' +
     '}';
   const ad = await graphGet<AdReadForSwap>(adId, accessToken, { fields });
 
@@ -431,6 +454,9 @@ export async function swapAdLeadForm(
     };
     if (afs.titles?.length) rebuilt.titles = afs.titles;
     if (afs.descriptions?.length) rebuilt.descriptions = afs.descriptions;
+    if (afs.asset_customization_rules?.length) {
+      rebuilt.asset_customization_rules = afs.asset_customization_rules;
+    }
 
     const oss = creative.object_story_spec;
     const ossOut: Record<string, unknown> = { page_id: oss?.page_id };
@@ -487,18 +513,27 @@ export interface RebindAdCreativeResult {
   previous_creative_id: string;
   new_creative_id: string;
   changed: boolean;
+  customization_rules_preserved: boolean | null;
 }
 
 /**
  * Rebind an ad to a different creative_id. Atomic. ad_id stays stable.
  * Use with createAdCreative to do full ad rebuilds (e.g. swap form + rebuild
  * text content) without touching the ad_id.
+ *
+ * Safety check: if the OLD creative has `asset_customization_rules` (per-placement
+ * image rules set in Ads Manager UI) and the NEW creative does not carry them
+ * forward, the rebind is REFUSED. This catches the 2026-05-14 RDR class of bug
+ * where multi-variant headline writes silently flattened custom placements by image.
+ * Pass `force=true` to override (e.g. when the new creative deliberately replaces
+ * the placement rules).
  */
 export async function rebindAdCreative(
   adId: string,
   newCreativeId: string,
   accessToken: string,
   dryRun: boolean,
+  force: boolean = false,
 ): Promise<RebindAdCreativeResult> {
   const before = await graphGet<{ id: string; name: string; creative?: { id: string } }>(
     adId,
@@ -513,8 +548,28 @@ export async function rebindAdCreative(
       previous_creative_id: previousId,
       new_creative_id: newCreativeId,
       changed: previousId !== newCreativeId && !dryRun,
+      customization_rules_preserved: null,
     };
   }
+
+  let preserved: boolean | null = null;
+  if (previousId && !force) {
+    const [oldRules, newRules] = await Promise.all([
+      fetchCustomizationRules(previousId, accessToken),
+      fetchCustomizationRules(newCreativeId, accessToken),
+    ]);
+    if (oldRules.length > 0 && newRules.length === 0) {
+      throw new Error(
+        `Refusing to rebind ad ${adId}: previous creative ${previousId} has ${oldRules.length} ` +
+        `asset_customization_rules (per-placement image rules set in Ads Manager UI), but new ` +
+        `creative ${newCreativeId} has none. Rebinding would silently drop custom placements ` +
+        `by image. Either (a) include asset_customization_rules in the new creative, or ` +
+        `(b) pass force=true if this drop is intentional.`,
+      );
+    }
+    preserved = oldRules.length === 0 ? null : newRules.length >= oldRules.length;
+  }
+
   await graphPost<AdUpdateResponse>(adId, accessToken, {
     creative: JSON.stringify({ creative_id: newCreativeId }),
   });
@@ -524,6 +579,7 @@ export async function rebindAdCreative(
     previous_creative_id: previousId,
     new_creative_id: newCreativeId,
     changed: true,
+    customization_rules_preserved: preserved,
   };
 }
 

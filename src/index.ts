@@ -689,13 +689,19 @@ const TOOL_REBIND_AD_CREATIVE = {
   description:
     'Rebind an ad to a different creative_id. ad_id stays stable. Use together with ' +
     'meta_ads_create_ad_creative to do full ad rebuilds (e.g. swap form + rebuild text content) ' +
-    'without losing performance history on the ad object. Pass dry_run=true to preview.',
+    'without losing performance history on the ad object. SAFETY: refuses to rebind when the ' +
+    'old creative has asset_customization_rules (per-placement image rules) and the new one ' +
+    'does not — pass force=true to override. Pass dry_run=true to preview.',
   inputSchema: {
     type: 'object',
     properties: {
       ad_id: { type: 'string', description: 'Meta ad id (numeric).' },
       creative_id: { type: 'string', description: 'New creative_id to bind to the ad.' },
       dry_run: { type: 'boolean', description: 'If true, return a diff without writing. Default false.' },
+      force: {
+        type: 'boolean',
+        description: 'Bypass the asset_customization_rules safety check. Use only when intentionally replacing per-placement image rules.',
+      },
     },
     required: ['ad_id', 'creative_id'],
   },
@@ -808,14 +814,15 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
       }
       case 'meta_ads_rebind_ad_creative': {
-        const { ad_id, creative_id, dry_run } = (args ?? {}) as {
+        const { ad_id, creative_id, dry_run, force } = (args ?? {}) as {
           ad_id?: string;
           creative_id?: string;
           dry_run?: boolean;
+          force?: boolean;
         };
         if (!ad_id) throw new Error('ad_id is required');
         if (typeof creative_id !== 'string' || !creative_id) throw new Error('creative_id is required');
-        const result = await rebindAdCreative(ad_id, creative_id, accessToken, Boolean(dry_run));
+        const result = await rebindAdCreative(ad_id, creative_id, accessToken, Boolean(dry_run), Boolean(force));
         return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
       }
       case 'meta_ads_create_campaign': {
