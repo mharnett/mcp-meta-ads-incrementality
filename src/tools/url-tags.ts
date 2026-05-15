@@ -764,9 +764,38 @@ export async function editCreativeText(
       });
     };
 
+    // Meta returns one entry per (asset, adlabel) pair, but rejects POSTs with
+    // duplicate asset values (subcode 1815629). Group by asset key and merge
+    // adlabels so the rebuilt spec has unique assets with multi-label arrays.
+    const dedupeAssets = <T extends { adlabels?: unknown[] }>(
+      arr: T[] | undefined,
+      keyFn: (a: T) => string,
+    ): T[] | undefined => {
+      if (!arr?.length) return arr;
+      const byKey = new Map<string, T & { adlabels: unknown[] }>();
+      for (const a of arr) {
+        const k = keyFn(a);
+        if (!k) continue;
+        const existing = byKey.get(k);
+        const labels = Array.isArray(a.adlabels) ? a.adlabels : [];
+        if (existing) {
+          const seen = new Set(existing.adlabels.map((l) => JSON.stringify(l)));
+          for (const l of labels) {
+            const s = JSON.stringify(l);
+            if (!seen.has(s)) { existing.adlabels.push(l); seen.add(s); }
+          }
+        } else {
+          byKey.set(k, { ...a, adlabels: [...labels] });
+        }
+      }
+      return Array.from(byKey.values()) as T[];
+    };
+
     const rebuilt: Record<string, unknown> = {};
-    if (afs.images?.length) rebuilt.images = afs.images;
-    if (afs.videos?.length) rebuilt.videos = afs.videos;
+    const dedupedImages = dedupeAssets(afs.images, (a) => a.hash ?? '');
+    const dedupedVideos = dedupeAssets(afs.videos, (a) => a.video_id ?? '');
+    if (dedupedImages?.length) rebuilt.images = dedupedImages;
+    if (dedupedVideos?.length) rebuilt.videos = dedupedVideos;
     if (afs.link_urls?.length) rebuilt.link_urls = afs.link_urls;
     if (afs.call_to_action_types?.length) rebuilt.call_to_action_types = afs.call_to_action_types;
     if (afs.call_to_actions?.length) rebuilt.call_to_actions = afs.call_to_actions;
