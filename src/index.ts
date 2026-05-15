@@ -37,6 +37,7 @@ import {
   renameAd,
   swapAdLeadForm,
   rebindAdCreative,
+  editCreativeText,
 } from './tools/url-tags.js';
 import {
   createCampaign,
@@ -707,6 +708,47 @@ const TOOL_REBIND_AD_CREATIVE = {
   },
 } as const;
 
+const TOOL_EDIT_CREATIVE_TEXT = {
+  name: 'meta_ads_edit_creative_text',
+  description:
+    'Edit the text fields (messages/headlines/descriptions) on an ad\'s creative while ' +
+    'PRESERVING images, videos, asset_customization_rules (per-placement image rules set ' +
+    'in Ads Manager UI), CTAs, and link_urls. Use this instead of create_ad_creative + ' +
+    'rebind_ad_creative when the ad has custom placements-by-image — the create+rebind ' +
+    'pattern silently flattens those rules. Refuses if asset_customization_rules reference ' +
+    'per-text labels (body_label/title_label/description_label) and the new text count ' +
+    'differs from the existing count — pass force=true to override. Multi-variant ads ' +
+    '(asset_feed_spec) accept up to 5 entries per field; legacy single-variant ads ' +
+    '(object_story_spec) accept ≤1 entry per field.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      ad_id: { type: 'string', description: 'Meta ad id (numeric).' },
+      messages: {
+        type: 'array',
+        items: { type: 'string' },
+        description: 'Up to 5 primary text variants. Replaces the entire bodies[] array.',
+      },
+      headlines: {
+        type: 'array',
+        items: { type: 'string' },
+        description: 'Up to 5 headline variants. Replaces the entire titles[] array.',
+      },
+      descriptions: {
+        type: 'array',
+        items: { type: 'string' },
+        description: 'Up to 5 description variants. Replaces the entire descriptions[] array.',
+      },
+      dry_run: { type: 'boolean', description: 'If true, return a diff without writing.' },
+      force: {
+        type: 'boolean',
+        description: 'Bypass the label-orphaning safety check (only for DCO-style ads with labeled text).',
+      },
+    },
+    required: ['ad_id'],
+  },
+} as const;
+
 const TOOLS = [
   TOOL_INSIGHTS_INCREMENTALITY,
   TOOL_LIST_ADS_IN_CAMPAIGN,
@@ -715,6 +757,7 @@ const TOOLS = [
   TOOL_RENAME_AD,
   TOOL_SWAP_AD_LEAD_FORM,
   TOOL_REBIND_AD_CREATIVE,
+  TOOL_EDIT_CREATIVE_TEXT,
   TOOL_CREATE_CAMPAIGN,
   TOOL_CREATE_ADSET,
   TOOL_CREATE_AD_CREATIVE,
@@ -823,6 +866,25 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         if (!ad_id) throw new Error('ad_id is required');
         if (typeof creative_id !== 'string' || !creative_id) throw new Error('creative_id is required');
         const result = await rebindAdCreative(ad_id, creative_id, accessToken, Boolean(dry_run), Boolean(force));
+        return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+      }
+      case 'meta_ads_edit_creative_text': {
+        const { ad_id, messages, headlines, descriptions, dry_run, force } = (args ?? {}) as {
+          ad_id?: string;
+          messages?: string[];
+          headlines?: string[];
+          descriptions?: string[];
+          dry_run?: boolean;
+          force?: boolean;
+        };
+        if (!ad_id) throw new Error('ad_id is required');
+        const result = await editCreativeText(
+          ad_id,
+          { messages, headlines, descriptions },
+          accessToken,
+          Boolean(dry_run),
+          Boolean(force),
+        );
         return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
       }
       case 'meta_ads_create_campaign': {

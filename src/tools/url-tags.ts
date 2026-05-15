@@ -584,6 +584,280 @@ export async function rebindAdCreative(
 }
 
 /* ------------------------------------------------------------------------- */
+/* Edit ad creative text (preserves images, videos, asset_customization_rules) */
+/* ------------------------------------------------------------------------- */
+
+export interface EditCreativeTextEdits {
+  messages?: string[];
+  headlines?: string[];
+  descriptions?: string[];
+}
+
+export interface EditCreativeTextResult {
+  ad_id: string;
+  ad_name: string;
+  previous_creative_id: string;
+  new_creative_id: string;
+  mode: 'asset_feed_spec' | 'object_story_spec';
+  changed_fields: string[];
+  customization_rules_preserved: number;
+}
+
+interface CreativeReadForEdit {
+  id: string;
+  name?: string;
+  url_tags?: string;
+  instagram_user_id?: string;
+  object_story_spec?: {
+    page_id?: string;
+    link_data?: {
+      link?: string;
+      message?: string;
+      name?: string;
+      description?: string;
+      image_hash?: string;
+      call_to_action?: { type?: string; value?: { lead_gen_form_id?: string; link?: string } };
+    };
+  };
+  asset_feed_spec?: {
+    images?: Array<{ hash?: string; adlabels?: unknown[] }>;
+    videos?: Array<{ video_id?: string; thumbnail_url?: string; adlabels?: unknown[] }>;
+    bodies?: Array<{ text?: string; adlabels?: unknown[] }>;
+    titles?: Array<{ text?: string; adlabels?: unknown[] }>;
+    descriptions?: Array<{ text?: string; adlabels?: unknown[] }>;
+    link_urls?: Array<{ website_url?: string; adlabels?: unknown[] }>;
+    call_to_action_types?: string[];
+    call_to_actions?: unknown[];
+    ad_formats?: string[];
+    optimization_type?: string;
+    asset_customization_rules?: Array<Record<string, unknown>>;
+  };
+}
+
+interface AdReadForEdit {
+  id: string;
+  name: string;
+  account_id?: string;
+  creative?: CreativeReadForEdit;
+}
+
+/**
+ * Edit text fields (primary texts / headlines / descriptions) on an ad's creative
+ * while PRESERVING images, videos, asset_customization_rules (per-placement image
+ * rules set in Ads Manager UI), call_to_actions, and link_urls.
+ *
+ * For asset_feed_spec ads: replaces only the specified text arrays. Refuses the
+ * edit if the existing asset_customization_rules reference per-text labels
+ * (body_label / title_label / description_label) and the new text count differs
+ * from the old — pass force=true to override (rules may end up referencing
+ * orphaned labels and break the placement targeting).
+ *
+ * For object_story_spec (legacy single-variant) ads: replaces link_data.message
+ * (single primary text), link_data.name (single headline), link_data.description.
+ * The messages/headlines/descriptions arrays must each have length ≤ 1 in that
+ * mode.
+ */
+export async function editCreativeText(
+  adId: string,
+  edits: EditCreativeTextEdits,
+  accessToken: string,
+  dryRun: boolean,
+  force: boolean = false,
+): Promise<EditCreativeTextResult> {
+  if (!edits.messages && !edits.headlines && !edits.descriptions) {
+    throw new Error('editCreativeText: provide at least one of messages, headlines, descriptions.');
+  }
+  // Note: Meta caps multi-variant asset_feed_spec at 5 entries per field, but DCO
+  // creatives with per-placement label customization can legitimately exceed this.
+  // We don't pre-validate the count — Meta will reject on POST if invalid.
+
+  // instagram_actor_id deprecated for reads in v22+. call_to_actions returns
+  // permission-denied on DCO-style creatives — fetch it best-effort, fall back
+  // to call_to_action_types on the rebuild.
+  const baseFields =
+    'id,name,account_id,creative{' +
+      'id,name,url_tags,instagram_user_id,' +
+      'object_story_spec{page_id,link_data{link,message,name,description,image_hash,call_to_action}},' +
+      'asset_feed_spec{' +
+        'images{hash,adlabels},videos{video_id,thumbnail_url,adlabels},' +
+        'bodies{text,adlabels},titles{text,adlabels},descriptions{text,adlabels},' +
+        'link_urls{website_url,adlabels},call_to_action_types,' +
+        'ad_formats,optimization_type,asset_customization_rules' +
+      '}' +
+    '}';
+  let ad = await graphGet<AdReadForEdit>(adId, accessToken, { fields: baseFields });
+  // Try to also fetch call_to_actions; if denied, proceed without them.
+  try {
+    const withCtas = await graphGet<AdReadForEdit>(adId, accessToken, {
+      fields: 'creative{asset_feed_spec{call_to_actions}}',
+    });
+    const ctas = withCtas.creative?.asset_feed_spec?.call_to_actions;
+    if (ad.creative?.asset_feed_spec && ctas?.length) {
+      ad.creative.asset_feed_spec.call_to_actions = ctas;
+    }
+  } catch {
+    // call_to_actions inaccessible (typical on DCO creatives) — skip.
+  }
+  const creative = ad.creative;
+  if (!creative) throw new Error(`Ad ${adId}: no creative attached.`);
+  if (!ad.account_id) throw new Error(`Ad ${adId}: response missing account_id.`);
+
+  const isAssetFeed = !!creative.asset_feed_spec && (creative.asset_feed_spec.bodies?.length ?? 0) > 0;
+  const mode: 'asset_feed_spec' | 'object_story_spec' = isAssetFeed ? 'asset_feed_spec' : 'object_story_spec';
+  const changedFields: string[] = [];
+
+  const acct = ad.account_id.startsWith('act_') ? ad.account_id : `act_${ad.account_id}`;
+  const body: Record<string, string> = {
+    name: `${creative.name ?? ad.name} — text-edit ${new Date().toISOString().slice(0, 10)}`,
+  };
+  if (creative.url_tags) body.url_tags = creative.url_tags;
+  if (creative.instagram_user_id) body.instagram_user_id = creative.instagram_user_id;
+
+  let rulesCount = 0;
+
+  if (isAssetFeed) {
+    const afs = creative.asset_feed_spec!;
+    rulesCount = afs.asset_customization_rules?.length ?? 0;
+
+    // Refuse if rules reference labels we'd be replacing AND the new array length differs.
+    const rulesRefs = JSON.stringify(afs.asset_customization_rules ?? []);
+    const refsBody = rulesRefs.includes('"body_label"');
+    const refsTitle = rulesRefs.includes('"title_label"');
+    const refsDesc = rulesRefs.includes('"description_label"');
+    if (!force) {
+      if (edits.messages && refsBody && edits.messages.length !== (afs.bodies?.length ?? 0)) {
+        throw new Error(
+          `Refusing to edit messages on ad ${adId}: asset_customization_rules reference body_label ` +
+          `and new length (${edits.messages.length}) differs from existing (${afs.bodies?.length ?? 0}). ` +
+          `Replacing would orphan label references. Pass force=true to override.`,
+        );
+      }
+      if (edits.headlines && refsTitle && edits.headlines.length !== (afs.titles?.length ?? 0)) {
+        throw new Error(
+          `Refusing to edit headlines on ad ${adId}: asset_customization_rules reference title_label ` +
+          `and new length (${edits.headlines.length}) differs from existing (${afs.titles?.length ?? 0}). ` +
+          `Pass force=true to override.`,
+        );
+      }
+      if (edits.descriptions && refsDesc && edits.descriptions.length !== (afs.descriptions?.length ?? 0)) {
+        throw new Error(
+          `Refusing to edit descriptions on ad ${adId}: asset_customization_rules reference ` +
+          `description_label and new length (${edits.descriptions.length}) differs from existing ` +
+          `(${afs.descriptions?.length ?? 0}). Pass force=true to override.`,
+        );
+      }
+    }
+
+    // Build replacement text arrays: keep adlabels[i] when present, swap text[i].
+    const swapText = (
+      existing: Array<{ text?: string; adlabels?: unknown[] }> | undefined,
+      newTexts: string[] | undefined,
+      fieldName: string,
+    ) => {
+      if (!newTexts) return existing;
+      changedFields.push(fieldName);
+      return newTexts.map((text, i) => {
+        const out: Record<string, unknown> = { text };
+        const lbl = existing?.[i]?.adlabels;
+        if (lbl && Array.isArray(lbl) && lbl.length) out.adlabels = lbl;
+        return out;
+      });
+    };
+
+    const rebuilt: Record<string, unknown> = {};
+    if (afs.images?.length) rebuilt.images = afs.images;
+    if (afs.videos?.length) rebuilt.videos = afs.videos;
+    if (afs.link_urls?.length) rebuilt.link_urls = afs.link_urls;
+    if (afs.call_to_action_types?.length) rebuilt.call_to_action_types = afs.call_to_action_types;
+    if (afs.call_to_actions?.length) rebuilt.call_to_actions = afs.call_to_actions;
+    if (afs.ad_formats?.length) rebuilt.ad_formats = afs.ad_formats;
+    if (afs.optimization_type) rebuilt.optimization_type = afs.optimization_type;
+
+    const newBodies = swapText(afs.bodies, edits.messages, 'messages');
+    const newTitles = swapText(afs.titles, edits.headlines, 'headlines');
+    const newDescriptions = swapText(afs.descriptions, edits.descriptions, 'descriptions');
+    if (newBodies?.length) rebuilt.bodies = newBodies;
+    if (newTitles?.length) rebuilt.titles = newTitles;
+    if (newDescriptions?.length) rebuilt.descriptions = newDescriptions;
+    if (afs.asset_customization_rules?.length) {
+      rebuilt.asset_customization_rules = afs.asset_customization_rules;
+    }
+
+    const oss = creative.object_story_spec;
+    const ossOut: Record<string, unknown> = { page_id: oss?.page_id };
+    if (oss?.link_data) ossOut.link_data = oss.link_data;
+
+    body.object_story_spec = JSON.stringify(ossOut);
+    body.asset_feed_spec = JSON.stringify(rebuilt);
+  } else {
+    // Legacy single-variant. Caller may pass 0 or 1 entry per field.
+    const oss = creative.object_story_spec;
+    const ld = oss?.link_data;
+    if (!oss?.page_id || !ld) {
+      throw new Error(`Ad ${adId} creative ${creative.id}: legacy creative missing page_id/link_data.`);
+    }
+    const linkData: Record<string, unknown> = { ...ld };
+    const setOne = (newArr: string[] | undefined, key: 'message' | 'name' | 'description', label: string) => {
+      if (!newArr) return;
+      if (newArr.length > 1) {
+        throw new Error(
+          `editCreativeText: ad ${adId} is single-variant (object_story_spec mode); ${label} ` +
+          `must have ≤1 entry (got ${newArr.length}). Use a multi-variant ad to mix headlines.`,
+        );
+      }
+      if (newArr.length === 1) {
+        linkData[key] = newArr[0];
+        changedFields.push(label);
+      }
+    };
+    setOne(edits.messages, 'message', 'messages');
+    setOne(edits.headlines, 'name', 'headlines');
+    setOne(edits.descriptions, 'description', 'descriptions');
+
+    const ossOut: Record<string, unknown> = { page_id: oss.page_id, link_data: linkData };
+    body.object_story_spec = JSON.stringify(ossOut);
+  }
+
+  if (changedFields.length === 0) {
+    return {
+      ad_id: ad.id,
+      ad_name: ad.name,
+      previous_creative_id: creative.id,
+      new_creative_id: creative.id,
+      mode,
+      changed_fields: [],
+      customization_rules_preserved: rulesCount,
+    };
+  }
+
+  if (dryRun) {
+    return {
+      ad_id: ad.id,
+      ad_name: ad.name,
+      previous_creative_id: creative.id,
+      new_creative_id: '',
+      mode,
+      changed_fields: changedFields,
+      customization_rules_preserved: rulesCount,
+    };
+  }
+
+  const created = await graphPost<CreativeCreateResponse>(`${acct}/adcreatives`, accessToken, body);
+  // Rebind WITHOUT force — relies on our own preservation; the safety check
+  // will catch any regression where we accidentally dropped customization rules.
+  await rebindAdCreative(adId, created.id, accessToken, false, false);
+  return {
+    ad_id: ad.id,
+    ad_name: ad.name,
+    previous_creative_id: creative.id,
+    new_creative_id: created.id,
+    mode,
+    changed_fields: changedFields,
+    customization_rules_preserved: rulesCount,
+  };
+}
+
+/* ------------------------------------------------------------------------- */
 /* Rename ad                                                                 */
 /* ------------------------------------------------------------------------- */
 
