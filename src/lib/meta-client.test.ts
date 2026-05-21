@@ -353,7 +353,10 @@ describe('MetaInsightsClient', () => {
         }),
       };
       const fakeClient = new MetaInsightsClient(fakeSdk, 'token');
-      await expect(fakeClient.getInsights(BASIC_PARAMS)).rejects.toBeTruthy();
+      // The SUT must propagate the original thrown value verbatim (not wrap it in
+      // an Error, not swallow it). Pinning the exact string proves both: the
+      // rejection happens AND the original value is preserved through the await.
+      await expect(fakeClient.getInsights(BASIC_PARAMS)).rejects.toBe('string error');
     });
   });
 });
