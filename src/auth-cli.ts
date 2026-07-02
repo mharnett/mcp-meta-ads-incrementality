@@ -17,10 +17,14 @@ import http from "http";
 import { URL } from "url";
 import { writeStoredCredentials, credentialsFilePath, CREDENTIALS_FILE_VERSION, type StoredCredentials } from "./credentials.js";
 import { findFreeLoopbackPort, openBrowser } from "./platform.js";
+import { GRAPH_VERSION } from "./lib/graph.js";
 
-const META_GRAPH_VERSION = "v24.0";
-const META_AUTH_URL = `https://www.facebook.com/${META_GRAPH_VERSION}/dialog/oauth`;
-const META_GRAPH_URL = `https://graph.facebook.com/${META_GRAPH_VERSION}`;
+// Auth endpoints share the single Graph-version source of truth (lib/graph.ts)
+// so the OAuth flow and the data calls can never drift apart again. OAuth dialog
+// and token exchange are stable across recent versions; deliberately bumping the
+// whole MCP to a newer Graph version is a separate, changelog-reviewed migration.
+const META_AUTH_URL = `https://www.facebook.com/${GRAPH_VERSION}/dialog/oauth`;
+const META_GRAPH_URL = `https://graph.facebook.com/${GRAPH_VERSION}`;
 const AUTH_SCOPE = "business_management,ads_read,ads_management,pages_show_list,pages_read_engagement";
 
 function parseArgs(argv: string[]): { help: boolean } {
