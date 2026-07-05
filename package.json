@@ -45,7 +45,7 @@
     "zod": "^3.22.4"
   },
   "devDependencies": {
-    "@drak/mcp-test-harness": "file:../mcp-test-harness",
+    "@drak-marketing/mcp-test-harness": "^0.1.2",
     "@types/facebook-nodejs-business-sdk": "^23.0.0",
     "@types/node": "^20.10.0",
     "tsx": "^4.7.0",
