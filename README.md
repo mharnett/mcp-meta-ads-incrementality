@@ -9,7 +9,7 @@ This MCP server makes that the default, and lets you ask for the standard window
 
 ## Status
 
-`v0.1.0` — early. One tool today (`meta_ads_insights_incrementality`). Comprehensive unit-test coverage of the incrementality math, attribution-window handling, and Meta SDK request shape (120+ tests). Real-API integration is unverified at this version — we recommend running it against a sandboxed account first.
+`v0.2.x` — 20 tools: incrementality-first insights plus a full write surface (campaign/ad-set/ad/creative builds, audiences, lead forms, budgets, URL tags, lifecycle). Comprehensive unit-test coverage of the incrementality math, attribution-window handling, and Meta SDK request shape. Write tools support `dry_run` where marked; we recommend testing writes against a sandboxed account first.
 
 This package is not affiliated with, endorsed by, or sponsored by Meta Platforms, Inc. "Meta" and "Facebook" are trademarks of Meta Platforms, Inc.
 
@@ -57,6 +57,34 @@ Claude Desktop or Claude Code, in `.mcp.json`:
 ```
 
 ## Tools
+
+| Tool | What it does |
+|---|---|
+| **Insights** | |
+| `meta_ads_insights_incrementality` | Insights with incrementality as the default attribution window (detailed below) |
+| **Campaign build** | |
+| `meta_ads_create_campaign` | Create a campaign |
+| `meta_ads_create_adset` | Create an ad set inside an existing campaign |
+| `meta_ads_create_ad_creative` | Create a single-image ad creative |
+| `meta_ads_create_ad` | Create an ad from an ad set + creative |
+| `meta_ads_upload_image` | Upload an image, returns `image_hash` + CDN URL |
+| **Audiences & lead forms** | |
+| `meta_ads_create_custom_audience` | Create an empty Custom Audience |
+| `meta_ads_upload_users_to_audience` | Upload (hashed) user records to a Custom Audience |
+| `meta_ads_create_lookalike_audience` | Create a Lookalike seeded from a Custom Audience |
+| `meta_ads_create_leadgen_form` | Create a lead-gen Instant Form on a Page |
+| `meta_ads_swap_ad_lead_form` | Swap the lead form on an existing ad (rebuild + rebind creative) |
+| **URL tags & naming** | |
+| `meta_ads_list_ads_in_campaign` | List ads with id, name, status, creative_id — discovery step for tag sweeps |
+| `meta_ads_get_ad_url_tags` | Read an ad's current `url_tags` + clickthrough link |
+| `meta_ads_update_ad_url_tags` | Update an ad's `url_tags` (supports `dry_run`) |
+| `meta_ads_rename_ad` | Rename an ad, validated against naming standards (supports `dry_run`) |
+| **Lifecycle & edits** | |
+| `meta_ads_update_object_status` | Pause/activate a campaign, ad set, or ad |
+| `meta_ads_update_budget` | Update daily/lifetime budget on a campaign or ad set |
+| `meta_ads_rebind_ad_creative` | Point an ad at a different creative |
+| `meta_ads_edit_creative_text` | Edit messages/headlines/descriptions on an ad |
+| `meta_ads_delete_object` | Permanently delete a campaign/ad set/ad/creative/audience |
 
 ### `meta_ads_insights_incrementality`
 
@@ -123,7 +151,7 @@ Use this MCP as the data source for your AI-driven reporting workflows. The defa
 ## Caveats
 
 - The `incrementality` attribution window is referenced in Meta's Breakdowns documentation but is not in the canonical `action_attribution_windows` enum on the Ad Account Insights reference page. We've defaulted to it because it's the right thing to report — but if Meta changes the API, this MCP will need to follow. Pin the version if stability matters more than correctness.
-- For agencies running campaigns where true incrementality matters at the dollar level, **Conversion Lift studies** (set up in advance with a randomized holdout group) remain the gold standard. This MCP does not yet expose those — that's planned for v0.2.
+- For agencies running campaigns where true incrementality matters at the dollar level, **Conversion Lift studies** (set up in advance with a randomized holdout group) remain the gold standard. This MCP does not yet expose those — that's on the roadmap.
 - Built on `facebook-nodejs-business-sdk` (Meta's official Node SDK). Inherits any quirks of that SDK including a known appsecret_proof pagination bug.
 
 ## License
