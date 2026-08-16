@@ -1,0 +1,27 @@
+{
+  "_comment": "VENDORED — do not edit. Canonical source: drak-ops src/drak_ops/ad_standards/naming_defaults.yaml. Regenerate with scripts/vendor-naming-defaults.sh when that file changes.",
+  "_source_sha256": "99741436ced0214523496fdfd79e97cb7763f3184960bbf0675c323c443de203",
+  "forbidden_chars": [
+    " ",
+    "(",
+    ")",
+    ",",
+    "&",
+    "?",
+    "#",
+    "=",
+    "+",
+    "%",
+    "/",
+    "\\",
+    "\"",
+    "'"
+  ],
+  "allowed_pattern": "^[A-Za-z0-9_\\-.:]+$",
+  "separator": "-",
+  "length": {
+    "campaign": 128,
+    "adgroup": 128,
+    "ad": 256
+  }
+}
