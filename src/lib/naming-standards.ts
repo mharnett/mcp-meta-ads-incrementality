@@ -1,12 +1,18 @@
 /**
- * Naming standards check — TS port of drak-ops/ad_standards/naming_defaults.yaml.
+ * Naming standards check — a TS implementation of shared ad-naming rules.
  *
- * Canonical source of truth is the YAML in drak-ops. This file mirrors those
- * rules so the Node-based MCP can validate without shelling out to Python.
- * If the YAML changes, update here too — search for the YAML's commit ts
- * comment to identify drift.
+ * The rules themselves are vendored in ./naming_defaults.json so this Node MCP
+ * can validate without shelling out to Python. naming-standards.test.ts asserts
+ * that validateName() actually enforces that vendored copy — so the constants
+ * below cannot drift from the rules without failing CI.
  *
- * Mirrors as of: drak-ops 6537d2e (2026-05-05).
+ * Do not hand-edit the constants to change a rule. Change it at the source and
+ * re-run scripts/vendor-naming-defaults.sh; the tests will tell you what to
+ * bring into line here.
+ *
+ * (This used to read "if the source changes, update here too", which is a
+ * hand-sync nothing enforced — it had been stale for three months in a
+ * published package before anyone looked.)
  */
 
 const FORBIDDEN_CHARS = [
