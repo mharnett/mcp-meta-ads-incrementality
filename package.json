@@ -17,8 +17,9 @@
     "build": "tsc",
     "start": "node dist/index.js",
     "dev": "tsx src/index.ts",
-    "test": "vitest run",
+    "test": "vitest run && npm run test:shell",
     "test:watch": "vitest",
+    "test:shell": "bash tests/run-mcp-keychain.test.sh",
     "smoke": "scripts/healthcheck.sh"
   },
   "keywords": [
