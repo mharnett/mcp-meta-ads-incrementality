@@ -28,6 +28,14 @@ export interface CreateCampaignInput {
   buying_type?: 'AUCTION' | 'RESERVED';
   daily_budget?: number;
   lifetime_budget?: number;
+  /**
+   * Whether ad sets in this campaign can share up to 20% of each other's budget.
+   * Meta requires this to be explicitly true/false whenever the campaign itself
+   * has no daily_budget/lifetime_budget (ABO) — omitting it 400s with subcode
+   * 4834011. Defaults to false (no sharing) for ABO campaigns when not passed;
+   * omitted entirely for CBO campaigns unless explicitly set.
+   */
+  is_adset_budget_sharing_enabled?: boolean;
 }
 
 export interface CreateCampaignResult {
@@ -52,6 +60,13 @@ export async function createCampaign(
   };
   if (input.daily_budget !== undefined) body.daily_budget = String(input.daily_budget);
   if (input.lifetime_budget !== undefined) body.lifetime_budget = String(input.lifetime_budget);
+
+  const isCbo = input.daily_budget !== undefined || input.lifetime_budget !== undefined;
+  if (input.is_adset_budget_sharing_enabled !== undefined) {
+    body.is_adset_budget_sharing_enabled = String(input.is_adset_budget_sharing_enabled);
+  } else if (!isCbo) {
+    body.is_adset_budget_sharing_enabled = 'false';
+  }
 
   const res = await graphPost<{ id: string }>(`${account}/campaigns`, accessToken, body);
   return { campaign_id: res.id, account_id: account, name: input.name, status };
@@ -149,6 +164,10 @@ export interface CreateAdCreativeInput {
   name: string;
   page_id: string;
   image_hash?: string;
+  /** Ad-account video library id (from meta_ads_upload_video or Ads Manager). Routes the creative through object_story_spec.video_data instead of link_data. */
+  video_id?: string;
+  /** Optional thumbnail override for a video creative; Meta auto-generates one if omitted. */
+  thumbnail_url?: string;
   link: string;
   /** Single primary text. Mutually exclusive with `messages`. */
   message?: string;
@@ -245,20 +264,37 @@ export async function createAdCreative(
     body.object_story_spec = JSON.stringify(objectStorySpec);
     body.asset_feed_spec = JSON.stringify(assetFeedSpec);
   } else {
-    const linkData: Record<string, unknown> = {
-      link: input.link,
-      message: messages[0],
-    };
-    if (input.image_hash) linkData.image_hash = input.image_hash;
-    if (headlines.length) linkData.name = headlines[0];
-    if (descriptions.length) linkData.description = descriptions[0];
-    if (callToAction) linkData.call_to_action = callToAction;
-
-    const objectStorySpec: Record<string, unknown> = {
-      page_id: input.page_id,
-      link_data: linkData,
-    };
+    const objectStorySpec: Record<string, unknown> = { page_id: input.page_id };
     if (input.instagram_actor_id) objectStorySpec.instagram_actor_id = input.instagram_actor_id;
+
+    if (input.video_id) {
+      // Plain object_story_spec.video_data — deliberately never routed through
+      // asset_feed_spec. Combining video_id with a `description` field there
+      // forces Meta to classify the creative as Dynamic Creative, which requires
+      // is_dynamic_creative on the ad set (immutable after creation) and then
+      // caps that ad set at one active ad. So: message + title only, no
+      // description, for every video creative. See NeonOne switcher campaign
+      // card (clients/neon-one/tasks/neonone-switcher-campaign.md) for the
+      // incident this was learned from.
+      const videoData: Record<string, unknown> = {
+        video_id: input.video_id,
+        message: messages[0],
+      };
+      if (headlines.length) videoData.title = headlines[0];
+      if (input.thumbnail_url) videoData.image_url = input.thumbnail_url;
+      videoData.call_to_action = callToAction ?? { type: 'LEARN_MORE', value: { link: input.link } };
+      objectStorySpec.video_data = videoData;
+    } else {
+      const linkData: Record<string, unknown> = {
+        link: input.link,
+        message: messages[0],
+      };
+      if (input.image_hash) linkData.image_hash = input.image_hash;
+      if (headlines.length) linkData.name = headlines[0];
+      if (descriptions.length) linkData.description = descriptions[0];
+      if (callToAction) linkData.call_to_action = callToAction;
+      objectStorySpec.link_data = linkData;
+    }
 
     body.object_story_spec = JSON.stringify(objectStorySpec);
   }

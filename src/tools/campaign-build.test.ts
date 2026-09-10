@@ -124,6 +124,28 @@ describe('createCampaign', () => {
     setupFetchMock([{ _status: 400, _body: { error: { code: 100, message: 'oops' } } }]);
     await expect(createCampaign(base, TOKEN)).rejects.toThrow(/oops/);
   });
+
+  it('defaults is_adset_budget_sharing_enabled to false for ABO campaigns (no campaign-level budget)', async () => {
+    // Meta rejects campaign creation with subcode 4834011 ("Must specify True or
+    // False in is_adset_budget_sharing_enabled") when no daily_budget/lifetime_budget
+    // is set at the campaign level. Default to false (no ad-set budget sharing)
+    // rather than making every ABO caller remember to pass this.
+    const { calls } = setupFetchMock([{ id: '1' }]);
+    await createCampaign(base, TOKEN);
+    expect(calls[0]?.body.get('is_adset_budget_sharing_enabled')).toBe('false');
+  });
+
+  it('omits is_adset_budget_sharing_enabled when daily_budget is provided (CBO)', async () => {
+    const { calls } = setupFetchMock([{ id: '1' }]);
+    await createCampaign({ ...base, daily_budget: 10000 }, TOKEN);
+    expect(calls[0]?.body.has('is_adset_budget_sharing_enabled')).toBe(false);
+  });
+
+  it('honors an explicit is_adset_budget_sharing_enabled override', async () => {
+    const { calls } = setupFetchMock([{ id: '1' }]);
+    await createCampaign({ ...base, is_adset_budget_sharing_enabled: true }, TOKEN);
+    expect(calls[0]?.body.get('is_adset_budget_sharing_enabled')).toBe('true');
+  });
 });
 
 /* ========================================================================= */
@@ -396,6 +418,64 @@ describe('createAdCreative', () => {
         TOKEN,
       ),
     ).rejects.toThrow(/image_hash/);
+  });
+
+  it('builds object_story_spec.video_data when video_id is provided', async () => {
+    const { calls } = setupFetchMock([{ id: 'cr_vid' }]);
+    await createAdCreative(
+      {
+        ...base,
+        image_hash: undefined,
+        video_id: 'vid_123',
+        headline: 'Watch this',
+      },
+      TOKEN,
+    );
+    const spec = JSON.parse(calls[0]!.body.get('object_story_spec')!);
+    expect(spec.page_id).toBe('111');
+    expect(spec.video_data.video_id).toBe('vid_123');
+    expect(spec.video_data.message).toBe('Primary text here');
+    expect(spec.video_data.title).toBe('Watch this');
+    expect(spec.video_data.call_to_action).toEqual({
+      type: 'LEARN_MORE',
+      value: { link: 'https://example.com/lp' },
+    });
+    expect(spec.link_data).toBeUndefined();
+  });
+
+  it('honors explicit call_to_action on a video creative', async () => {
+    const { calls } = setupFetchMock([{ id: 'cr_vid' }]);
+    await createAdCreative(
+      {
+        ...base,
+        image_hash: undefined,
+        video_id: 'vid_123',
+        call_to_action: { type: 'SIGN_UP', value: { lead_gen_form_id: 'form_1' } },
+      },
+      TOKEN,
+    );
+    const spec = JSON.parse(calls[0]!.body.get('object_story_spec')!);
+    expect(spec.video_data.call_to_action).toEqual({
+      type: 'SIGN_UP',
+      value: { lead_gen_form_id: 'form_1' },
+    });
+  });
+
+  it('includes thumbnail_url as video_data.image_url when provided', async () => {
+    const { calls } = setupFetchMock([{ id: 'cr_vid' }]);
+    await createAdCreative(
+      { ...base, image_hash: undefined, video_id: 'vid_123', thumbnail_url: 'https://x/thumb.jpg' },
+      TOKEN,
+    );
+    const spec = JSON.parse(calls[0]!.body.get('object_story_spec')!);
+    expect(spec.video_data.image_url).toBe('https://x/thumb.jpg');
+  });
+
+  it('omits video_data.title when no headline is given for a video ad', async () => {
+    const { calls } = setupFetchMock([{ id: 'cr_vid' }]);
+    await createAdCreative({ ...base, image_hash: undefined, video_id: 'vid_123' }, TOKEN);
+    const spec = JSON.parse(calls[0]!.body.get('object_story_spec')!);
+    expect(spec.video_data.title).toBeUndefined();
   });
 
   it('caps variants at 5', async () => {
