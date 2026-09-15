@@ -11,6 +11,13 @@ describe('Meta Graph API version — single source of truth', () => {
     expect(GRAPH_BASE).toBe(`https://graph.facebook.com/${GRAPH_VERSION}`);
   });
 
+  it('GRAPH_VERSION is pinned to v24.0 per the v22-to-v24 edge audit', () => {
+    // The audit (tasks/audit-the-meta-graph-v22-to-v24-diff-before-bumping-the-incrementality-pin.md)
+    // found no write-edge or read-surface changes across v23.0/v24.0 that touch fields
+    // this MCP sends or reads, clearing the pin bump.
+    expect(GRAPH_VERSION).toBe('v24.0');
+  });
+
   it('auth-cli imports the shared version and hardcodes no Graph version of its own', () => {
     // Regression guard for the v24.0-vs-v22.0 drift: auth-cli previously pinned
     // its own META_GRAPH_VERSION = "v24.0" while data calls used v22.0. No module
