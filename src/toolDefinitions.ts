@@ -175,6 +175,13 @@ const TOOL_CREATE_CAMPAIGN = {
       buying_type: { type: 'string', enum: ['AUCTION', 'RESERVED'], description: 'Default AUCTION.' },
       daily_budget: { type: 'number', description: 'Cents. Set only for CBO campaigns.' },
       lifetime_budget: { type: 'number', description: 'Cents. Alternative to daily_budget.' },
+      is_adset_budget_sharing_enabled: {
+        type: 'boolean',
+        description:
+          'Whether ad sets can share up to 20% of each other\'s budget. Meta requires this ' +
+          'explicitly when the campaign has no daily_budget/lifetime_budget (ABO) — defaults ' +
+          'to false automatically for ABO campaigns if omitted.',
+      },
     },
     required: ['account_id', 'name', 'objective'],
   },
@@ -237,18 +244,22 @@ const TOOL_CREATE_ADSET = {
 const TOOL_CREATE_AD_CREATIVE = {
   name: 'meta_ads_create_ad_creative',
   description:
-    'Create a Meta ad creative (single image). Two modes: (1) legacy object_story_spec ' +
-    'when message/headline/description are single strings; (2) asset_feed_spec / Flexible Ads ' +
-    'when any of messages[]/headlines[]/descriptions[] has >1 entry — Meta then mix-and-matches ' +
-    'variants per impression (cap 5 each). Pass lead_gen_form_id to auto-wire the SIGN_UP CTA. ' +
-    'Pair with meta_ads_upload_image to get an image_hash.',
+    'Create a Meta ad creative (image or video). Modes: (1) legacy object_story_spec.link_data ' +
+    'when image_hash is set and message/headline/description are single strings; (2) ' +
+    'object_story_spec.video_data when video_id is set — message + title only, deliberately no ' +
+    'description field, to avoid Meta forcing Dynamic Creative classification; (3) asset_feed_spec ' +
+    '/ Flexible Ads (image only) when any of messages[]/headlines[]/descriptions[] has >1 entry — ' +
+    'Meta then mix-and-matches variants per impression (cap 5 each). Pass lead_gen_form_id to ' +
+    'auto-wire the SIGN_UP CTA. Pair with meta_ads_upload_image for image_hash.',
   inputSchema: {
     type: 'object',
     properties: {
       account_id: { type: 'string' },
       name: { type: 'string' },
       page_id: { type: 'string' },
-      image_hash: { type: 'string', description: 'From meta_ads_upload_image. Required for both single and asset_feed_spec modes.' },
+      image_hash: { type: 'string', description: 'From meta_ads_upload_image. Required for both single and asset_feed_spec image modes.' },
+      video_id: { type: 'string', description: 'Ad-account video library id. Routes the creative through object_story_spec.video_data instead of link_data. Mutually exclusive with asset_feed_spec (multi-variant) mode.' },
+      thumbnail_url: { type: 'string', description: 'Optional thumbnail override for a video creative; Meta auto-generates one if omitted.' },
       link: { type: 'string', description: 'Clickthrough URL.' },
       message: { type: 'string', description: 'Single primary text. Mutually exclusive with messages[].' },
       messages: {
