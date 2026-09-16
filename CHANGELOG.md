@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.0](https://github.com/mharnett/mcp-meta-ads-incrementality/compare/mcp-meta-ads-incrementality-v0.3.0...mcp-meta-ads-incrementality-v0.4.0) (2026-09-16)
+
+
+### Features
+
+* is_adset_budget_sharing_enabled default + video ad creative support ([#12](https://github.com/mharnett/mcp-meta-ads-incrementality/issues/12)) ([e4ab9f6](https://github.com/mharnett/mcp-meta-ads-incrementality/commit/e4ab9f6708f7c10473c4abe05890d3b01a6be031))
+
 ## [0.3.0](https://github.com/mharnett/mcp-meta-ads-incrementality/compare/mcp-meta-ads-incrementality-v0.2.3...mcp-meta-ads-incrementality-v0.3.0) (2026-09-03)
 
 
