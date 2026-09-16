@@ -3,7 +3,7 @@
  * the SDK's insights-shaped abstraction. Extracted from tools/url-tags.ts so
  * audience and lead-form writers can share the same error formatting.
  */
-export const GRAPH_VERSION = 'v22.0';
+export const GRAPH_VERSION = 'v24.0';
 export const GRAPH_BASE = `https://graph.facebook.com/${GRAPH_VERSION}`;
 
 export interface GraphErrorBody {
