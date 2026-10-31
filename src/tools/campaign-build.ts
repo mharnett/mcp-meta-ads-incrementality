@@ -273,9 +273,8 @@ export async function createAdCreative(
       // forces Meta to classify the creative as Dynamic Creative, which requires
       // is_dynamic_creative on the ad set (immutable after creation) and then
       // caps that ad set at one active ad. So: message + title only, no
-      // description, for every video creative. See NeonOne switcher campaign
-      // card (clients/neon-one/tasks/neonone-switcher-campaign.md) for the
-      // incident this was learned from.
+      // description, for every video creative. Learned from a live client
+      // campaign build incident.
       const videoData: Record<string, unknown> = {
         video_id: input.video_id,
         message: messages[0],
