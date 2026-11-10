@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.1](https://github.com/mharnett/mcp-meta-ads-incrementality/compare/mcp-meta-ads-incrementality-v0.4.0...mcp-meta-ads-incrementality-v0.4.1) (2026-11-10)
+
+
+### Bug Fixes
+
+* remove client name from campaign-build comment (277ed63)
+
 ## [0.4.0](https://github.com/mharnett/mcp-meta-ads-incrementality/compare/mcp-meta-ads-incrementality-v0.3.0...mcp-meta-ads-incrementality-v0.4.0) (2026-09-16)
 
 
