@@ -4,5 +4,6 @@
     ".": {
       "release-type": "node"
     }
-  }
+  },
+  "last-release-sha": "82c2cf620e810c5dbe1d940feefdefe64f17e33a"
 }
