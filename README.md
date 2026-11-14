@@ -7,6 +7,37 @@ Most agency reports today use Meta's default 7-day-click + 1-day-view attributed
 
 This MCP server makes that the default, and lets you ask for the standard windows in the same call to quantify the gap.
 
+## Quick install
+
+Claude Code, one line (replace the placeholder with your own token; see [Auth](#auth) for how to get one):
+
+```bash
+claude mcp add --env META_ACCESS_TOKEN=YOUR_ACCESS_TOKEN --transport stdio mcp-meta-ads-incrementality -- npx -y mcp-meta-ads-incrementality
+```
+
+The server starts read-only. Set `META_ADS_MCP_WRITE=true` to expose tools that change an account.
+
+<details>
+<summary>Claude Desktop</summary>
+
+Add this to `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS), then fully quit and restart Claude Desktop:
+
+```json
+{
+  "mcpServers": {
+    "mcp-meta-ads-incrementality": {
+      "command": "npx",
+      "args": ["-y", "mcp-meta-ads-incrementality"],
+      "env": {
+        "META_ACCESS_TOKEN": "YOUR_ACCESS_TOKEN"
+      }
+    }
+  }
+}
+```
+
+</details>
+
 ## Status
 
 `v0.2.x` — 20 tools: incrementality-first insights plus a full write surface (campaign/ad-set/ad/creative builds, audiences, lead forms, budgets, URL tags, lifecycle). Comprehensive unit-test coverage of the incrementality math, attribution-window handling, and Meta SDK request shape. Write tools support `dry_run` where marked; we recommend testing writes against a sandboxed account first.
