@@ -40,7 +40,7 @@ Add this to `~/Library/Application Support/Claude/claude_desktop_config.json` (m
 
 ## Status
 
-`v0.2.x` — 20 tools: incrementality-first insights plus a full write surface (campaign/ad-set/ad/creative builds, audiences, lead forms, budgets, URL tags, lifecycle). Comprehensive unit-test coverage of the incrementality math, attribution-window handling, and Meta SDK request shape. Write tools support `dry_run` where marked; we recommend testing writes against a sandboxed account first.
+`v0.4.x` — 20 tools: 3 read-only tools (always available) plus 17 write tools that appear only when `META_ADS_MCP_WRITE=true`. The read-only three are incrementality-first insights, ad listing and URL-tag reads; the write surface covers campaign/ad-set/ad/creative builds, audiences, lead forms, budgets, URL-tag updates and lifecycle. Comprehensive unit-test coverage of the incrementality math, attribution-window handling, and Meta SDK request shape. Write tools support `dry_run` where marked; we recommend testing writes against a sandboxed account first.
 
 This package is not affiliated with, endorsed by, or sponsored by Meta Platforms, Inc. "Meta" and "Facebook" are trademarks of Meta Platforms, Inc.
 
@@ -88,6 +88,8 @@ Claude Desktop or Claude Code, in `.mcp.json`:
 ```
 
 ## Tools
+
+Only the three read tools are exposed by default: `meta_ads_insights_incrementality`, `meta_ads_list_ads_in_campaign` and `meta_ads_get_ad_url_tags`. The other 17 need `META_ADS_MCP_WRITE=true`.
 
 | Tool | What it does |
 |---|---|
