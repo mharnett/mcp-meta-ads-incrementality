@@ -18,6 +18,7 @@ import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
 
 import { TOOLS } from './toolDefinitions.js';
 import { WRITE_DISABLED_MESSAGE, WRITE_TOOLS } from './writeGate.js';
+import { ENABLE_TOOL } from './lib/create-status.js';
 
 const h = vi.hoisted(() => ({
   clientTransport: undefined as unknown as Transport,
@@ -63,11 +64,16 @@ vi.mock('@modelcontextprotocol/sdk/server/stdio.js', async () => {
 interface RecordedFetch {
   url: string;
   method: string;
+  body: URLSearchParams;
 }
 
 const fetchCalls: RecordedFetch[] = [];
 const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
-  fetchCalls.push({ url: String(input), method: init?.method ?? 'GET' });
+  fetchCalls.push({
+    url: String(input),
+    method: init?.method ?? 'GET',
+    body: new URLSearchParams(init?.body ? String(init.body) : ''),
+  });
   return new Response(
     JSON.stringify({
       id: '990000000000001',
@@ -232,5 +238,71 @@ describe('index.ts CallTool handler: write gate at the call site', () => {
       const names = tools.map((t) => t.name);
       for (const name of writeNames) expect(names).toContain(name);
     });
+  });
+});
+
+/**
+ * Create tools that take a status. Each must create PAUSED and refuse any
+ * other status before touching the Graph API.
+ */
+const CREATE_TOOLS_WITH_STATUS = [
+  'meta_ads_create_ad',
+  'meta_ads_create_adset',
+  'meta_ads_create_campaign',
+];
+
+describe('create tools are PAUSED only (writes enabled)', () => {
+  beforeEach(() => {
+    vi.stubEnv('META_ADS_MCP_WRITE', 'true');
+  });
+
+  it('covers every create tool that takes a status', () => {
+    const withStatus = TOOLS.filter(
+      (t) =>
+        t.name.includes('_create_') &&
+        'status' in ((t.inputSchema as { properties?: Record<string, unknown> }).properties ?? {}),
+    ).map((t) => t.name);
+    expect(withStatus.sort()).toEqual(CREATE_TOOLS_WITH_STATUS);
+  });
+
+  for (const name of CREATE_TOOLS_WITH_STATUS) {
+    for (const status of ['ACTIVE', 'active', 'ARCHIVED', 'DELETED', '']) {
+      it(`${name} refuses status=${JSON.stringify(status)} before any Graph request`, async () => {
+        const result = await client.callTool({
+          name,
+          arguments: { ...WRITE_TOOL_ARGS[name], status },
+        });
+
+        expect(result.isError).toBe(true);
+        expect(textOf(result)).toContain(`${name} creates objects PAUSED only`);
+        expect(textOf(result)).toContain(`then enable it separately with ${ENABLE_TOOL}`);
+        expect(fetchCalls).toEqual([]);
+      });
+    }
+
+    for (const status of [undefined, 'PAUSED', 'paused']) {
+      it(`${name} with status=${JSON.stringify(status)} creates PAUSED`, async () => {
+        const args = { ...WRITE_TOOL_ARGS[name] };
+        if (status !== undefined) args.status = status;
+
+        const result = await client.callTool({ name, arguments: args });
+
+        expect(result.isError ?? false).toBe(false);
+        const posts = fetchCalls.filter((c) => c.method === 'POST');
+        expect(posts).toHaveLength(1);
+        expect(posts[0]?.body.get('status')).toBe('PAUSED');
+      });
+    }
+  }
+
+  it('leaves the update tool free to enable an object', async () => {
+    const result = await client.callTool({
+      name: 'meta_ads_update_object_status',
+      arguments: { object_id: CAMPAIGN, status: 'ACTIVE' },
+    });
+
+    expect(result.isError ?? false).toBe(false);
+    expect(fetchCalls).toHaveLength(1);
+    expect(fetchCalls[0]?.body.get('status')).toBe('ACTIVE');
   });
 });

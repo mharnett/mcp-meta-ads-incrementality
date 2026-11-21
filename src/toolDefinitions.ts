@@ -154,8 +154,9 @@ const TOOL_RENAME_AD = {
 const TOOL_CREATE_CAMPAIGN = {
   name: 'meta_ads_create_campaign',
   description:
-    'Create a Meta ad campaign. Defaults to PAUSED status so the MCP cannot accidentally take ' +
-    'spend live. Set buying_type=AUCTION (default) for the standard auction model. CBO callers ' +
+    'Create a Meta ad campaign. Always created PAUSED so the MCP cannot take spend live; any ' +
+    'other status is refused. Enable it afterwards with meta_ads_update_object_status. ' +
+    'Set buying_type=AUCTION (default) for the standard auction model. CBO callers ' +
     'pass daily_budget at the campaign level; ABO callers omit it and budget at the ad set level.',
   inputSchema: {
     type: 'object',
@@ -166,7 +167,7 @@ const TOOL_CREATE_CAMPAIGN = {
         type: 'string',
         description: 'Meta objective enum, e.g. OUTCOME_LEADS, OUTCOME_TRAFFIC, OUTCOME_SALES.',
       },
-      status: { type: 'string', enum: ['PAUSED', 'ACTIVE'], description: 'Default PAUSED.' },
+      status: { type: 'string', enum: ['PAUSED'], description: 'Must be PAUSED (the default).' },
       special_ad_categories: {
         type: 'array',
         items: { type: 'string' },
@@ -190,7 +191,8 @@ const TOOL_CREATE_CAMPAIGN = {
 const TOOL_CREATE_ADSET = {
   name: 'meta_ads_create_adset',
   description:
-    'Create a Meta ad set inside an existing campaign. Defaults to PAUSED. For ON_AD lead-gen ' +
+    'Create a Meta ad set inside an existing campaign. Always created PAUSED; any other status is ' +
+    'refused (enable with meta_ads_update_object_status). For ON_AD lead-gen ' +
     'ad sets, pass destination_type="ON_AD" and promoted_object={page_id}. For OFFSITE ' +
     'conversions, promoted_object={page_id, pixel_id, custom_event_type}. Pass is_incremental_' +
     'attribution_enabled=true to switch to Meta\'s Incremental Conversions optimization (per ' +
@@ -217,7 +219,7 @@ const TOOL_CREATE_ADSET = {
       },
       bid_amount: { type: 'number', description: 'Cents. Required for COST_CAP / WITH_BID_CAP.' },
       targeting: { type: 'object', description: 'Full Meta targeting spec.' },
-      status: { type: 'string', enum: ['PAUSED', 'ACTIVE'] },
+      status: { type: 'string', enum: ['PAUSED'], description: 'Must be PAUSED (the default).' },
       daily_budget: { type: 'number', description: 'Cents.' },
       lifetime_budget: { type: 'number', description: 'Cents.' },
       promoted_object: { type: 'object' },
@@ -313,7 +315,8 @@ const TOOL_CREATE_AD_CREATIVE = {
 const TOOL_CREATE_AD = {
   name: 'meta_ads_create_ad',
   description:
-    'Create a Meta ad attached to an ad set and creative. Defaults to PAUSED.',
+    'Create a Meta ad attached to an ad set and creative. Always created PAUSED; any other ' +
+    'status is refused (enable with meta_ads_update_object_status).',
   inputSchema: {
     type: 'object',
     properties: {
@@ -321,7 +324,7 @@ const TOOL_CREATE_AD = {
       name: { type: 'string' },
       adset_id: { type: 'string' },
       creative_id: { type: 'string' },
-      status: { type: 'string', enum: ['PAUSED', 'ACTIVE'] },
+      status: { type: 'string', enum: ['PAUSED'], description: 'Must be PAUSED (the default).' },
     },
     required: ['account_id', 'name', 'adset_id', 'creative_id'],
   },

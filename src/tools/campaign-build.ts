@@ -1,15 +1,16 @@
 /**
  * Tier 1 write tools: campaign / ad set / ad creative / ad / image upload.
  *
- * Defaults to PAUSED status on every object so MCP callers can build a full
- * campaign hierarchy without accidentally going live. Callers must explicitly
- * flip status=ACTIVE (today via meta_ads_update_object_status, or directly in
- * Ads Manager) after review.
+ * Every object is created PAUSED so MCP callers can build a full campaign
+ * hierarchy without going live. Any other status on create is refused (see
+ * lib/create-status); callers enable objects separately, after review, with
+ * meta_ads_update_object_status or in Ads Manager.
  *
  * Image uploads use Meta's `bytes` form field (base64-encoded image data) —
  * keeps everything on the standard form-urlencoded POST shape used by lib/graph.
  */
 import { graphPost } from '../lib/graph.js';
+import { pausedCreateStatus } from '../lib/create-status.js';
 
 function normalizeAccountId(accountId: string): string {
   return accountId.startsWith('act_') ? accountId : `act_${accountId}`;
@@ -23,7 +24,8 @@ export interface CreateCampaignInput {
   account_id: string;
   name: string;
   objective: string;
-  status?: 'PAUSED' | 'ACTIVE';
+  /** Must be PAUSED (the default); anything else is refused. */
+  status?: string;
   special_ad_categories?: string[];
   buying_type?: 'AUCTION' | 'RESERVED';
   daily_budget?: number;
@@ -49,8 +51,8 @@ export async function createCampaign(
   input: CreateCampaignInput,
   accessToken: string,
 ): Promise<CreateCampaignResult> {
+  const status = pausedCreateStatus('meta_ads_create_campaign', input.status);
   const account = normalizeAccountId(input.account_id);
-  const status = input.status ?? 'PAUSED';
   const body: Record<string, string> = {
     name: input.name,
     objective: input.objective,
@@ -85,7 +87,8 @@ export interface CreateAdSetInput {
   bid_strategy?: 'LOWEST_COST_WITHOUT_CAP' | 'LOWEST_COST_WITH_BID_CAP' | 'COST_CAP';
   bid_amount?: number;
   targeting: Record<string, unknown>;
-  status?: 'PAUSED' | 'ACTIVE';
+  /** Must be PAUSED (the default); anything else is refused. */
+  status?: string;
   daily_budget?: number;
   lifetime_budget?: number;
   promoted_object?: Record<string, unknown>;
@@ -108,6 +111,7 @@ export async function createAdSet(
   input: CreateAdSetInput,
   accessToken: string,
 ): Promise<CreateAdSetResult> {
+  const status = pausedCreateStatus('meta_ads_create_adset', input.status);
   if (input.daily_budget !== undefined && input.lifetime_budget !== undefined) {
     throw new Error('createAdSet: pass daily_budget OR lifetime_budget, not both.');
   }
@@ -118,7 +122,6 @@ export async function createAdSet(
   }
 
   const account = normalizeAccountId(input.account_id);
-  const status = input.status ?? 'PAUSED';
   const body: Record<string, string> = {
     name: input.name,
     campaign_id: input.campaign_id,
@@ -316,7 +319,8 @@ export interface CreateAdInput {
   name: string;
   adset_id: string;
   creative_id: string;
-  status?: 'PAUSED' | 'ACTIVE';
+  /** Must be PAUSED (the default); anything else is refused. */
+  status?: string;
 }
 
 export interface CreateAdResult {
@@ -332,8 +336,8 @@ export async function createAd(
   input: CreateAdInput,
   accessToken: string,
 ): Promise<CreateAdResult> {
+  const status = pausedCreateStatus('meta_ads_create_ad', input.status);
   const account = normalizeAccountId(input.account_id);
-  const status = input.status ?? 'PAUSED';
   const body: Record<string, string> = {
     name: input.name,
     adset_id: input.adset_id,
