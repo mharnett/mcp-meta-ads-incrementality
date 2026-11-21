@@ -78,10 +78,12 @@ describe('createCampaign', () => {
     expect(calls[0]?.body.get('status')).toBe('PAUSED');
   });
 
-  it('honors explicit status=ACTIVE', async () => {
+  it('refuses status=ACTIVE before any request', async () => {
     const { calls } = setupFetchMock([{ id: '1' }]);
-    await createCampaign({ ...base, status: 'ACTIVE' }, TOKEN);
-    expect(calls[0]?.body.get('status')).toBe('ACTIVE');
+    await expect(createCampaign({ ...base, status: 'ACTIVE' }, TOKEN)).rejects.toThrow(
+      /PAUSED only.*meta_ads_update_object_status/,
+    );
+    expect(calls).toEqual([]);
   });
 
   it('defaults special_ad_categories to []', async () => {
@@ -185,6 +187,14 @@ describe('createAdSet', () => {
     const { calls } = setupFetchMock([{ id: '1' }]);
     await createAdSet(base, TOKEN);
     expect(calls[0]?.body.get('status')).toBe('PAUSED');
+  });
+
+  it('refuses status=ACTIVE before any request', async () => {
+    const { calls } = setupFetchMock([{ id: '1' }]);
+    await expect(createAdSet({ ...base, status: 'ACTIVE' }, TOKEN)).rejects.toThrow(
+      /PAUSED only.*meta_ads_update_object_status/,
+    );
+    expect(calls).toEqual([]);
   });
 
   it('JSON-serializes targeting', async () => {
@@ -534,6 +544,14 @@ describe('createAd', () => {
     const { calls } = setupFetchMock([{ id: '1' }]);
     await createAd(base, TOKEN);
     expect(calls[0]?.body.get('status')).toBe('PAUSED');
+  });
+
+  it('refuses status=ACTIVE before any request', async () => {
+    const { calls } = setupFetchMock([{ id: '1' }]);
+    await expect(createAd({ ...base, status: 'ACTIVE' }, TOKEN)).rejects.toThrow(
+      /PAUSED only.*meta_ads_update_object_status/,
+    );
+    expect(calls).toEqual([]);
   });
 });
 
