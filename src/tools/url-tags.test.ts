@@ -10,7 +10,7 @@ import {
 } from './url-tags.js';
 
 /**
- * Regression test for the 2026-05-14 RDR incident (commit 38b49f1).
+ * Regression test for the 2026-05-14 placement-rule incident (commit 38b49f1).
  *
  * Production bug class: meta_ads_create_ad_creative + meta_ads_rebind_ad_creative
  * was used to swap a creative on a live ad. The OLD creative had 4
@@ -54,7 +54,7 @@ describe('rebindAdCreative — asset_customization_rules safety check', () => {
   it('refuses rebind when old creative has rules and new creative has none', async () => {
     const { calls } = setupFetchMock((url) => {
       if (url.includes(`/${AD_ID}?`) || url.endsWith(`/${AD_ID}`)) {
-        return { id: AD_ID, name: 'RDR — headline test', creative: { id: OLD_CREATIVE_ID } };
+        return { id: AD_ID, name: 'Example ad — headline test', creative: { id: OLD_CREATIVE_ID } };
       }
       if (url.includes(`/${OLD_CREATIVE_ID}`)) {
         return {
@@ -202,15 +202,21 @@ interface UrlTagsWorld {
   failLearning?: boolean;
   /** The current creative's placement rules as the rule check reads them; a GraphFail is a failed read. Default: none. */
   oldRules?: unknown[] | GraphFail;
+  /** What that read returns once the new creative exists, if different. */
+  oldRulesAfterCreate?: unknown[] | GraphFail;
   /** The rebind POST fails with this Graph error. */
   rebindError?: GraphFail;
 }
 
 function urlTagsMock(world: UrlTagsWorld) {
+  let created = false;
   let rebound = false;
   const calls = graphMock((c) => {
     if (c.method === 'GET' && c.query.fields === RULE_READ) {
-      if (c.path === world.creativeId) return ruleReply(c.path, world.oldRules ?? []);
+      if (c.path === world.creativeId) {
+        const rules = created && world.oldRulesAfterCreate !== undefined ? world.oldRulesAfterCreate : world.oldRules;
+        return ruleReply(c.path, rules ?? []);
+      }
       // The new creative is built from the Page post and url_tags alone, so it has no asset_feed_spec.
       if (c.path === 'cr_new') return { id: 'cr_new' };
     }
@@ -238,7 +244,10 @@ function urlTagsMock(world: UrlTagsWorld) {
       const ts = rebound && world.learningTsAfterRebind !== undefined ? world.learningTsAfterRebind : world.learningTs;
       return { learning_stage_info: { status: 'SUCCESS', last_significant_edit_ts: ts } };
     }
-    if (c.method === 'POST' && c.path.endsWith('/adcreatives')) return { id: 'cr_new' };
+    if (c.method === 'POST' && c.path.endsWith('/adcreatives')) {
+      created = true;
+      return { id: 'cr_new' };
+    }
     if (c.method === 'POST' && c.path === 'ad_1') {
       if (world.rebindError) return world.rebindError;
       rebound = true;
@@ -308,7 +317,70 @@ describe('updateAdUrlTags', () => {
       changed: true,
       learning_after: null,
       significant_edit_triggered: null,
+      would_refuse: null,
     });
+    // The dry run ran the placement-rule check on the current creative.
+    expect(ruleReads(calls)).toEqual(['cr_old']);
+  });
+
+  /**
+   * The placement-rule check runs before the create, so a refused call leaves
+   * no unattached creative behind, and a dry run can report the refusal. Each
+   * world runs the real call and the dry run against the same fake Graph: the
+   * dry run's would_refuse must be the exact message the real call throws.
+   */
+  const urlTagsRefusals: Array<[string, Partial<UrlTagsWorld>, RegExp]> = [
+    [
+      'the current creative has placement rules the new creative would not carry',
+      { oldRules: RULES },
+      /^Refusing to rebind ad ad_1: current creative cr_old has 2 asset_customization_rules.*the new creative this call would create carries none/s,
+    ],
+    [
+      'the current creative’s placement rules cannot be read',
+      { oldRules: new GraphFail('Application does not have permission for this action', 10) },
+      /^Refusing to rebind ad ad_1: could not read the placement rules.*does not have permission/s,
+    ],
+  ];
+
+  it.each(urlTagsRefusals)('%s: the real call refuses before creating anything', async (_label, w, refusal) => {
+    const calls = urlTagsMock({ ...base, ...w });
+
+    const err = await updateAdUrlTags('ad_1', 'utm_source=new', TOKEN, false).then(
+      () => null,
+      (e: unknown) => e as Error,
+    );
+
+    expect(err?.message).toMatch(refusal);
+    expect(err?.message).toMatch(/Nothing was created or changed/);
+    expect(err?.message).not.toMatch(/created by this call/);
+    // No create POST, so no creative is left unattached; no rebind POST either.
+    expect(posts(calls)).toEqual([]);
+    expect(ruleReads(calls)).toEqual(['cr_old']);
+  });
+
+  it.each(urlTagsRefusals)('%s: the dry run returns that refusal as would_refuse and sends no POST', async (_label, w) => {
+    urlTagsMock({ ...base, ...w });
+    const real = await updateAdUrlTags('ad_1', 'utm_source=new', TOKEN, false).then(
+      () => null,
+      (e: unknown) => e as Error,
+    );
+    expect(real?.message).toMatch(/^Refusing to rebind ad ad_1: /);
+
+    const calls = urlTagsMock({ ...base, ...w });
+    const r = await updateAdUrlTags('ad_1', 'utm_source=new', TOKEN, true);
+
+    expect(r).toMatchObject({ changed: true, new_creative_id: '', would_refuse: real!.message });
+    expect(posts(calls)).toEqual([]);
+  });
+
+  it('dry run when the url_tags already match: nothing to check, nothing to refuse', async () => {
+    const calls = urlTagsMock({ ...base, oldRules: RULES });
+
+    const r = await updateAdUrlTags('ad_1', 'utm_source=old', TOKEN, true);
+
+    expect(r).toMatchObject({ changed: false, would_refuse: null });
+    expect(ruleReads(calls)).toEqual([]);
+    expect(posts(calls)).toEqual([]);
   });
 
   it('sends no POST when the url_tags already match', async () => {
@@ -319,6 +391,7 @@ describe('updateAdUrlTags', () => {
     expect(posts(calls)).toEqual([]);
     expect(r.changed).toBe(false);
     expect(r.new_creative_id).toBe('cr_old');
+    expect(r).not.toHaveProperty('would_refuse'); // real runs never carry it
   });
 
   it('refuses before any POST when the creative has no Page-post reference', async () => {
@@ -355,41 +428,32 @@ describe('updateAdUrlTags', () => {
       changed: true,
       significant_edit_triggered: false,
     });
-    // The rebind went through the placement-rule check: both creatives' rules
-    // were read, and only then was the ad rebound.
-    expect(ruleReads(calls)).toEqual(['cr_new', 'cr_old']);
+    expect(r).not.toHaveProperty('would_refuse'); // real runs never carry it
+    // The current creative's rules were checked before the create, and the
+    // rebind then ran the full check on both creatives before the ad moved.
+    expect(ruleReads(calls)).toEqual(['cr_new', 'cr_old', 'cr_old']);
+    const firstRuleRead = calls.findIndex((c) => c.query.fields === RULE_READ);
+    expect(calls[firstRuleRead]?.path).toBe('cr_old');
+    expect(firstRuleRead).toBeLessThan(calls.indexOf(create!));
     const lastRuleRead = Math.max(...calls.flatMap((c, i) => (c.query.fields === RULE_READ ? [i] : [])));
     expect(calls.indexOf(rebind!)).toBeGreaterThan(lastRuleRead);
   });
 
-  it('refuses to rebind when the new creative would drop the ad’s placement rules, and leaves the ad on its creative', async () => {
-    const calls = urlTagsMock({ ...base, oldRules: RULES });
+  it('if the rules read fails after the create, the rebind still refuses and names the creative left behind', async () => {
+    // The pre-create check passed; the rebind's own check then could not read
+    // the rules. That race is the one way a refusal can still follow a create.
+    const calls = urlTagsMock({ ...base, oldRulesAfterCreate: new GraphFail('Service temporarily unavailable', 2) });
 
     const err = await updateAdUrlTags('ad_1', 'utm_source=new', TOKEN, false).then(
       () => null,
       (e: unknown) => e as Error,
     );
 
-    expect(err?.message).toMatch(
-      /^Refusing to rebind ad ad_1: previous creative cr_old has 2 asset_customization_rules.*new creative cr_new has none/s,
-    );
-    // The creative was created, but the ad was never rebound to it.
-    expect(posts(calls).map((c) => c.path)).toEqual(['act_111/adcreatives']);
+    expect(err?.message).toMatch(/^Refusing to rebind ad ad_1: could not read the placement rules.*temporarily unavailable/s);
     // This tool has no force option, so the refusal names the creative it left behind and the tool that can attach it.
     expect(err?.message).toMatch(/creative cr_new, created by this call, is not attached to ad ad_1/);
     expect(err?.message).toMatch(/meta_ads_rebind_ad_creative with ad_id=ad_1, creative_id=cr_new and force=true/);
-  });
-
-  it('refuses to rebind when the current creative’s placement rules cannot be read', async () => {
-    const calls = urlTagsMock({
-      ...base,
-      oldRules: new GraphFail('Application does not have permission for this action', 10),
-    });
-
-    await expect(updateAdUrlTags('ad_1', 'utm_source=new', TOKEN, false)).rejects.toThrow(
-      /^Refusing to rebind ad ad_1: could not read the placement rules.*does not have permission/s,
-    );
-    expect(posts(calls).filter((c) => c.path === 'ad_1')).toEqual([]);
+    expect(posts(calls).map((c) => c.path)).toEqual(['act_111/adcreatives']);
   });
 
   it('a Graph error on the rebind POST passes through as is, without the refusal note', async () => {
@@ -504,6 +568,18 @@ function swapMock(
   });
 }
 
+/**
+ * A creative whose images are customized by placement but whose asset_feed_spec
+ * has no bodies, so the swap rebuilds it as a legacy link_data creative, which
+ * carries no asset_customization_rules.
+ */
+function bodilessRulesCreative() {
+  return {
+    ...legacyCreative(),
+    asset_feed_spec: { images: [{ hash: 'h1' }, { hash: 'h2' }], asset_customization_rules: RULES },
+  };
+}
+
 describe('swapAdLeadForm', () => {
   it('dry run reports the swap and sends no POST', async () => {
     const calls = swapMock(assetFeedCreative());
@@ -511,7 +587,16 @@ describe('swapAdLeadForm', () => {
     const r = await swapAdLeadForm('ad_1', 'form_new', TOKEN, true);
 
     expect(posts(calls)).toEqual([]);
-    expect(r).toMatchObject({ previous_form_id: 'form_old', new_form_id: 'form_new', mode: 'asset_feed_spec', changed: true, new_creative_id: '' });
+    expect(r).toMatchObject({
+      previous_form_id: 'form_old',
+      new_form_id: 'form_new',
+      mode: 'asset_feed_spec',
+      changed: true,
+      new_creative_id: '',
+      // The rebuilt creative carries the ad's placement rules, so the check passes.
+      would_refuse: null,
+    });
+    expect(ruleReads(calls)).toEqual(['cr_old']);
   });
 
   it('sends no POST when the ad already uses the form', async () => {
@@ -521,6 +606,74 @@ describe('swapAdLeadForm', () => {
 
     expect(posts(calls)).toEqual([]);
     expect(r.changed).toBe(false);
+    expect(r).not.toHaveProperty('would_refuse'); // real runs never carry it
+  });
+
+  /**
+   * As for url_tags: the placement-rule check runs before the create, and the
+   * dry run reports the exact refusal the real call throws.
+   */
+  const swapRefusals: Array<[string, () => GraphCall[], RegExp]> = [
+    [
+      'the creative it would build carries none of the ad’s placement rules',
+      () => swapMock(bodilessRulesCreative()),
+      /^Refusing to rebind ad ad_1: current creative cr_old has 2 asset_customization_rules.*the new creative this call would create carries none/s,
+    ],
+    [
+      'the current creative’s placement rules cannot be read',
+      () => swapMock(legacyCreative(), '111', { oldRules: new GraphFail('User request limit reached', 17) }),
+      /^Refusing to rebind ad ad_1: could not read the placement rules.*User request limit reached/s,
+    ],
+  ];
+
+  it.each(swapRefusals)('%s: the real call refuses before creating anything', async (_label, setup, refusal) => {
+    const calls = setup();
+
+    const err = await swapAdLeadForm('ad_1', 'form_new', TOKEN, false).then(
+      () => null,
+      (e: unknown) => e as Error,
+    );
+
+    expect(err?.message).toMatch(refusal);
+    expect(err?.message).toMatch(/Nothing was created or changed/);
+    expect(err?.message).not.toMatch(/created by this call/);
+    expect(posts(calls)).toEqual([]);
+    expect(ruleReads(calls)).toEqual(['cr_old']);
+  });
+
+  it.each(swapRefusals)('%s: the dry run returns that refusal as would_refuse and sends no POST', async (_label, setup) => {
+    setup();
+    const real = await swapAdLeadForm('ad_1', 'form_new', TOKEN, false).then(
+      () => null,
+      (e: unknown) => e as Error,
+    );
+    expect(real?.message).toMatch(/^Refusing to rebind ad ad_1: /);
+
+    const calls = setup();
+    const r = await swapAdLeadForm('ad_1', 'form_new', TOKEN, true);
+
+    expect(r).toMatchObject({ changed: true, new_creative_id: '', would_refuse: real!.message });
+    expect(posts(calls)).toEqual([]);
+  });
+
+  it('dry run of a legacy creative with no placement rules reports no refusal', async () => {
+    const calls = swapMock(legacyCreative());
+
+    const r = await swapAdLeadForm('ad_1', 'form_new', TOKEN, true);
+
+    expect(r).toMatchObject({ mode: 'object_story_spec', changed: true, would_refuse: null });
+    expect(ruleReads(calls)).toEqual(['cr_old']);
+    expect(posts(calls)).toEqual([]);
+  });
+
+  it('dry run when the ad already uses the form: nothing to check, nothing to refuse', async () => {
+    const calls = swapMock(bodilessRulesCreative());
+
+    const r = await swapAdLeadForm('ad_1', 'form_old', TOKEN, true);
+
+    expect(r).toMatchObject({ changed: false, would_refuse: null });
+    expect(ruleReads(calls)).toEqual([]);
+    expect(posts(calls)).toEqual([]);
   });
 
   it('asset-feed creative: carries every asset, the placement rules and url_tags into the new creative', async () => {
@@ -547,12 +700,19 @@ describe('swapAdLeadForm', () => {
     expect(rebind?.path).toBe('ad_1');
     expect(json(rebind?.form.creative)).toEqual({ creative_id: 'cr_new' });
     expect(r).toMatchObject({ previous_creative_id: 'cr_old', new_creative_id: 'cr_new', changed: true });
-    // The rebind went through the placement-rule check before the rebind POST.
-    expect(ruleReads(calls)).toEqual(['cr_new', 'cr_old']);
+    expect(r).not.toHaveProperty('would_refuse'); // real runs never carry it
+    // The current creative's rules were checked before the create, and the
+    // rebind then ran the full check on both creatives before the rebind POST.
+    expect(ruleReads(calls)).toEqual(['cr_new', 'cr_old', 'cr_old']);
+    const firstRuleRead = calls.findIndex((c) => c.query.fields === RULE_READ);
+    expect(calls[firstRuleRead]?.path).toBe('cr_old');
+    expect(firstRuleRead).toBeLessThan(calls.indexOf(create!));
     const lastRuleRead = Math.max(...calls.flatMap((c, i) => (c.query.fields === RULE_READ ? [i] : [])));
     expect(calls.indexOf(rebind!)).toBeGreaterThan(lastRuleRead);
   });
 
+  // The pre-create check can't see this one: Meta returns the new creative
+  // without the rules it was sent, so the refusal comes after the create.
   it('asset-feed: refuses to rebind when the new creative comes back without the placement rules', async () => {
     const calls = swapMock(assetFeedCreative(), '111', { newRules: [] });
 
@@ -566,15 +726,6 @@ describe('swapAdLeadForm', () => {
     );
     expect(err?.message).toMatch(/creative cr_new, created by this call, is not attached to ad ad_1/);
     expect(posts(calls).map((c) => c.path)).toEqual(['act_111/adcreatives']);
-  });
-
-  it('refuses to rebind when the current creative’s placement rules cannot be read', async () => {
-    const calls = swapMock(legacyCreative(), '111', { oldRules: new GraphFail('User request limit reached', 17) });
-
-    await expect(swapAdLeadForm('ad_1', 'form_new', TOKEN, false)).rejects.toThrow(
-      /^Refusing to rebind ad ad_1: could not read the placement rules.*User request limit reached/s,
-    );
-    expect(posts(calls).filter((c) => c.path === 'ad_1')).toEqual([]);
   });
 
   it('legacy creative: rebuilds link_data with the new form and adds the act_ prefix', async () => {

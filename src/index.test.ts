@@ -358,6 +358,92 @@ describe('meta_ads_rebind_ad_creative dry_run at the call site (writes enabled)'
   });
 });
 
+/**
+ * meta_ads_update_ad_url_tags and meta_ads_swap_ad_lead_form build a new
+ * creative from the ad's current one. The ad below sits on a creative with a
+ * per-placement image rule that the new creative would not carry, so the real
+ * call refuses. The refusal must come before the create (no POST at all, so no
+ * unattached creative), and the dry run must return it as a result.
+ */
+describe('create-then-rebind tools refuse before the create, and dry_run reports it, at the call site (writes enabled)', () => {
+  const OLD_CREATIVE = '120000000000043';
+  const PLACEMENT_RULE = { customization_spec: { publisher_platforms: ['facebook'] }, image_label: { name: 'fb' } };
+
+  const cases: Array<[string, Record<string, unknown>, Record<string, unknown>, string[]]> = [
+    [
+      'meta_ads_update_ad_url_tags',
+      { ad_id: AD, url_tags: 'utm_source=new' },
+      { url_tags: 'utm_source=old', object_story_id: `${PAGE}_1` },
+      [
+        'ad_id',
+        'ad_name',
+        'changed',
+        'learning_after',
+        'learning_before',
+        'new_creative_id',
+        'new_url_tags',
+        'previous_creative_id',
+        'previous_url_tags',
+        'significant_edit_triggered',
+        'would_refuse',
+      ],
+    ],
+    [
+      'meta_ads_swap_ad_lead_form',
+      { ad_id: AD, new_form_id: FORM },
+      {
+        object_story_spec: {
+          page_id: PAGE,
+          link_data: {
+            link: 'https://example.com/',
+            message: 'Body',
+            call_to_action: { type: 'SIGN_UP', value: { lead_gen_form_id: '100000000000077' } },
+          },
+        },
+      },
+      ['ad_id', 'ad_name', 'changed', 'mode', 'new_creative_id', 'new_form_id', 'previous_creative_id', 'previous_form_id', 'would_refuse'],
+    ],
+  ];
+
+  it.each(cases)('%s: the real call refuses with no POST, and the dry run returns that refusal', async (name, args, creative, keys) => {
+    vi.stubEnv('META_ADS_MCP_WRITE', 'true');
+    const restore = fetchMock.getMockImplementation()!;
+    fetchMock.mockImplementation(async (input: string | URL | Request, init?: RequestInit) => {
+      const u = new URL(String(input));
+      fetchCalls.push({ url: u.toString(), method: init?.method ?? 'GET', body: new URLSearchParams(init?.body ? String(init.body) : '') });
+      const id = u.pathname.split('/').pop();
+      const body =
+        id === AD
+          ? {
+              id: AD,
+              name: 'Call-site ad',
+              account_id: ACCOUNT.replace(/^act_/, ''),
+              campaign_id: CAMPAIGN,
+              creative: { id: OLD_CREATIVE, ...creative },
+            }
+          : id === OLD_CREATIVE
+            ? { id, asset_feed_spec: { asset_customization_rules: [PLACEMENT_RULE] } }
+            : { id };
+      return new Response(JSON.stringify(body), { status: 200, headers: { 'content-type': 'application/json' } });
+    });
+    try {
+      const dry = await client.callTool({ name, arguments: { ...args, dry_run: true } });
+      const real = await client.callTool({ name, arguments: args });
+
+      expect(dry.isError ?? false).toBe(false);
+      const out = JSON.parse(textOf(dry));
+      expect(Object.keys(out).sort()).toEqual(keys);
+      expect(out).toMatchObject({ ad_id: AD, previous_creative_id: OLD_CREATIVE, new_creative_id: '', changed: true });
+      expect(out.would_refuse).toMatch(/^Refusing to rebind ad .*Nothing was created or changed/s);
+      expect(real.isError).toBe(true);
+      expect(textOf(real)).toContain(out.would_refuse);
+      expect(fetchCalls.filter((c) => c.method === 'POST')).toEqual([]);
+    } finally {
+      fetchMock.mockImplementation(restore);
+    }
+  });
+});
+
 describe('meta_ads_edit_creative_text dry_run at the call site (writes enabled)', () => {
   const OLD_CREATIVE = '120000000000042';
 

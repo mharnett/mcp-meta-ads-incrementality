@@ -100,10 +100,12 @@ const TOOL_UPDATE_AD_URL_TAGS = {
     'campaignid={{campaign.id}}". Note Meta uses double-brace macros ({{campaign.id}}, ' +
     '{{ad.id}}, {{ad.name}}, etc.), not Google-Ads-style single braces. ' +
     'Mechanism: creates a new creative on the same Page post with the new url_tags, then ' +
-    'rebinds the ad to it, keeping the ad_id stable. SAFETY: the rebind runs the same ' +
-    'placement-rule check as meta_ads_rebind_ad_creative and refuses when the ad\'s ' +
-    'per-placement image rules (asset_customization_rules) would be dropped or can\'t be read; ' +
-    'dry_run does not run that check. Pass dry_run=true to preview without writing. ' +
+    'rebinds the ad to it, keeping the ad_id stable. SAFETY: runs the same placement-rule ' +
+    'check as meta_ads_rebind_ad_creative and refuses when the ad\'s per-placement image rules ' +
+    '(asset_customization_rules) would be dropped or can\'t be read. The check runs before the ' +
+    'new creative is created, so a refused call creates and changes nothing. Pass dry_run=true ' +
+    'to preview: it runs the same check without writing and returns would_refuse, the refusal ' +
+    'the real call would give, or null if it would go ahead. ' +
     'Recommend testing on a PAUSED ad before touching active ones — Meta may briefly re-review.',
   inputSchema: {
     type: 'object',
@@ -117,7 +119,10 @@ const TOOL_UPDATE_AD_URL_TAGS = {
       },
       dry_run: {
         type: 'boolean',
-        description: 'If true, return a diff without writing. Default false.',
+        description:
+          'If true, run the placement-rule check and return the diff without writing: ' +
+          'would_refuse is the refusal the real call would give, or null if it would go ahead. ' +
+          'Default false.',
       },
     },
     required: ['ad_id', 'url_tags'],
@@ -559,11 +564,13 @@ const TOOL_SWAP_AD_LEAD_FORM = {
     'Swap the lead form on an existing Meta ad by rebuilding its creative with a new ' +
     'lead_gen_form_id, then rebinding the ad. Ad_id stays stable. Handles both legacy ' +
     'object_story_spec creatives and modern asset_feed_spec (Flexible Ads) creatives — ' +
-    'preserves all image/text content, only the SIGN_UP CTA form_id changes. SAFETY: the rebind ' +
-    'runs the same placement-rule check as meta_ads_rebind_ad_creative and refuses when the ' +
-    'ad\'s per-placement image rules (asset_customization_rules) would be dropped or can\'t be ' +
-    'read; dry_run does not run that check. Pass dry_run=true to preview. Meta may briefly ' +
-    're-review the ad after the swap.',
+    'preserves all image/text content, only the SIGN_UP CTA form_id changes. SAFETY: runs the ' +
+    'same placement-rule check as meta_ads_rebind_ad_creative and refuses when the ad\'s ' +
+    'per-placement image rules (asset_customization_rules) would be dropped or can\'t be read. ' +
+    'The check runs before the new creative is created, so a refused call creates and changes ' +
+    'nothing. Pass dry_run=true to preview: it runs the same check without writing and returns ' +
+    'would_refuse, the refusal the real call would give, or null if it would go ahead. Meta may ' +
+    'briefly re-review the ad after the swap.',
   inputSchema: {
     type: 'object',
     properties: {
@@ -575,7 +582,13 @@ const TOOL_SWAP_AD_LEAD_FORM = {
           'Override the CTA button type (e.g. DOWNLOAD, SIGN_UP, LEARN_MORE, GET_OFFER). ' +
           'If omitted, preserves the existing CTA type from the ad\'s current creative.',
       },
-      dry_run: { type: 'boolean', description: 'If true, return a diff without writing. Default false.' },
+      dry_run: {
+        type: 'boolean',
+        description:
+          'If true, run the placement-rule check and return the diff without writing: ' +
+          'would_refuse is the refusal the real call would give, or null if it would go ahead. ' +
+          'Default false.',
+      },
     },
     required: ['ad_id', 'new_form_id'],
   },
