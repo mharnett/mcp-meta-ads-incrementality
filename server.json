@@ -1,0 +1,37 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.mharnett/meta-ads-incrementality",
+  "description": "Meta Ads MCP built on incrementality: incremental vs 7d-click/1d-view conversions, side by side.",
+  "repository": {
+    "url": "https://github.com/mharnett/mcp-meta-ads-incrementality",
+    "source": "github"
+  },
+  "version": "0.4.1",
+  "packages": [
+    {
+      "registryType": "npm",
+      "identifier": "mcp-meta-ads-incrementality",
+      "version": "0.4.1",
+      "transport": {
+        "type": "stdio"
+      },
+      "environmentVariables": [
+        {
+          "name": "META_ACCESS_TOKEN",
+          "description": "Meta Marketing API access token (a System User token is recommended). Needed unless you have cached an OAuth token with mcp-meta-ads-auth.",
+          "isRequired": false,
+          "isSecret": true,
+          "format": "string"
+        },
+        {
+          "name": "META_ADS_MCP_WRITE",
+          "description": "Set to true to expose the tools that change an account. Unset, the server is read-only.",
+          "isRequired": false,
+          "isSecret": false,
+          "format": "string",
+          "default": "false"
+        }
+      ]
+    }
+  ]
+}
