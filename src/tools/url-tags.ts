@@ -527,6 +527,83 @@ export interface RebindAdCreativeResult {
   new_creative_id: string;
   changed: boolean;
   customization_rules_preserved: boolean | null;
+  /**
+   * Dry runs only. The message the real call would refuse with, or null when
+   * it would go ahead. A real call that would refuse throws that message
+   * instead, so it never carries this field.
+   */
+  would_refuse?: string | null;
+}
+
+/** Outcome of the rebind rule check: go ahead (with the preserved flag), or the refusal. */
+type RebindRuleCheck =
+  | { ok: true; preserved: boolean | null }
+  | { ok: false; refusal: string };
+
+/**
+ * The asset_customization_rules safety check for moving `adId` from
+ * `previousId` to `newCreativeId`. Reads only. The real rebind throws the
+ * refusal; a dry run reports it.
+ */
+async function checkRebindRules(
+  adId: string,
+  previousId: string,
+  newCreativeId: string,
+  accessToken: string,
+): Promise<RebindRuleCheck> {
+  if (!previousId) {
+    return {
+      ok: false,
+      refusal:
+        `Refusing to rebind ad ${adId}: the ad read returned no current creative, so there is ` +
+        `no way to check whether this rebind would drop per-placement image rules ` +
+        `(asset_customization_rules). Nothing was changed. Retry; if it keeps happening, open ` +
+        `the ad in Ads Manager and check whether its images are customized by placement. Pass ` +
+        `force=true only once you have confirmed it has none, or that dropping them is intentional.`,
+    };
+  }
+  const [oldRead, newRead] = await Promise.all([
+    fetchCustomizationRules(previousId, accessToken),
+    fetchCustomizationRules(newCreativeId, accessToken),
+  ]);
+  if (!oldRead.ok) {
+    return {
+      ok: false,
+      refusal:
+        `Refusing to rebind ad ${adId}: could not read the placement rules ` +
+        `(asset_customization_rules) on its current creative ${previousId}, so there is no way ` +
+        `to tell whether this rebind would drop them. Nothing was changed. Read error: ` +
+        `${oldRead.error}. To proceed: (a) retry, since the error may be transient; (b) if it ` +
+        `keeps failing, open the ad in Ads Manager and check whether its images are customized ` +
+        `by placement, and if they are, make the change there; (c) pass force=true only once you ` +
+        `have confirmed the ad has no placement rules, or that dropping them is intentional.`,
+    };
+  }
+  const oldRules = oldRead.rules;
+  if (oldRules.length > 0 && !newRead.ok) {
+    return {
+      ok: false,
+      refusal:
+        `Refusing to rebind ad ${adId}: current creative ${previousId} has ${oldRules.length} ` +
+        `asset_customization_rules (per-placement image rules set in Ads Manager UI), and this ` +
+        `tool could not read the rules on new creative ${newCreativeId}, so it can't confirm they ` +
+        `carry over. Nothing was changed. Read error: ${newRead.error}. Retry, or pass force=true ` +
+        `once you have confirmed the new creative carries the rules or the drop is intentional.`,
+    };
+  }
+  const newRules = newRead.ok ? newRead.rules : [];
+  if (oldRules.length > 0 && newRules.length === 0) {
+    return {
+      ok: false,
+      refusal:
+        `Refusing to rebind ad ${adId}: previous creative ${previousId} has ${oldRules.length} ` +
+        `asset_customization_rules (per-placement image rules set in Ads Manager UI), but new ` +
+        `creative ${newCreativeId} has none. Rebinding would silently drop custom placements ` +
+        `by image. Either (a) include asset_customization_rules in the new creative, or ` +
+        `(b) pass force=true if this drop is intentional.`,
+    };
+  }
+  return { ok: true, preserved: oldRules.length === 0 ? null : newRules.length >= oldRules.length };
 }
 
 /**
@@ -547,6 +624,11 @@ export interface RebindAdCreativeResult {
  *
  * Pass `force=true` to override (e.g. when the new creative deliberately replaces
  * the placement rules, or a failed read has been checked by hand in Ads Manager).
+ *
+ * `dryRun=true` makes the same reads and runs the same check, then returns
+ * without writing: `would_refuse` is the message the real call would throw, or
+ * null when it would go ahead, and `customization_rules_preserved` is what the
+ * real call would report.
  */
 export async function rebindAdCreative(
   adId: string,
@@ -561,77 +643,36 @@ export async function rebindAdCreative(
     { fields: 'id,name,creative{id}' },
   );
   const previousId = before.creative?.id ?? '';
-  if (dryRun || previousId === newCreativeId) {
-    return {
-      ad_id: before.id,
-      ad_name: before.name,
-      previous_creative_id: previousId,
-      new_creative_id: newCreativeId,
-      changed: previousId !== newCreativeId && !dryRun,
-      customization_rules_preserved: null,
-    };
-  }
-
-  let preserved: boolean | null = null;
-  if (!force) {
-    if (!previousId) {
-      throw new Error(
-        `Refusing to rebind ad ${adId}: the ad read returned no current creative, so there is ` +
-        `no way to check whether this rebind would drop per-placement image rules ` +
-        `(asset_customization_rules). Nothing was changed. Retry; if it keeps happening, open ` +
-        `the ad in Ads Manager and check whether its images are customized by placement. Pass ` +
-        `force=true only once you have confirmed it has none, or that dropping them is intentional.`,
-      );
-    }
-    const [oldRead, newRead] = await Promise.all([
-      fetchCustomizationRules(previousId, accessToken),
-      fetchCustomizationRules(newCreativeId, accessToken),
-    ]);
-    if (!oldRead.ok) {
-      throw new Error(
-        `Refusing to rebind ad ${adId}: could not read the placement rules ` +
-        `(asset_customization_rules) on its current creative ${previousId}, so there is no way ` +
-        `to tell whether this rebind would drop them. Nothing was changed. Read error: ` +
-        `${oldRead.error}. To proceed: (a) retry, since the error may be transient; (b) if it ` +
-        `keeps failing, open the ad in Ads Manager and check whether its images are customized ` +
-        `by placement, and if they are, make the change there; (c) pass force=true only once you ` +
-        `have confirmed the ad has no placement rules, or that dropping them is intentional.`,
-      );
-    }
-    const oldRules = oldRead.rules;
-    if (oldRules.length > 0 && !newRead.ok) {
-      throw new Error(
-        `Refusing to rebind ad ${adId}: current creative ${previousId} has ${oldRules.length} ` +
-        `asset_customization_rules (per-placement image rules set in Ads Manager UI), and this ` +
-        `tool could not read the rules on new creative ${newCreativeId}, so it can't confirm they ` +
-        `carry over. Nothing was changed. Read error: ${newRead.error}. Retry, or pass force=true ` +
-        `once you have confirmed the new creative carries the rules or the drop is intentional.`,
-      );
-    }
-    const newRules = newRead.ok ? newRead.rules : [];
-    if (oldRules.length > 0 && newRules.length === 0) {
-      throw new Error(
-        `Refusing to rebind ad ${adId}: previous creative ${previousId} has ${oldRules.length} ` +
-        `asset_customization_rules (per-placement image rules set in Ads Manager UI), but new ` +
-        `creative ${newCreativeId} has none. Rebinding would silently drop custom placements ` +
-        `by image. Either (a) include asset_customization_rules in the new creative, or ` +
-        `(b) pass force=true if this drop is intentional.`,
-      );
-    }
-    preserved = oldRules.length === 0 ? null : newRules.length >= oldRules.length;
-  }
-
-  await graphPost<AdUpdateResponse>(adId, accessToken, {
-    creative: JSON.stringify({ creative_id: newCreativeId }),
-  });
-  return {
+  const ids = {
     ad_id: before.id,
     ad_name: before.name,
     previous_creative_id: previousId,
     new_creative_id: newCreativeId,
-    changed: true,
-    customization_rules_preserved: preserved,
   };
+  const dryRunField = (refusal: string | null) => (dryRun ? { would_refuse: refusal } : {});
+
+  if (previousId === newCreativeId) {
+    return { ...ids, changed: false, customization_rules_preserved: null, ...dryRunField(null) };
+  }
+
+  const check: RebindRuleCheck = force
+    ? { ok: true, preserved: null }
+    : await checkRebindRules(adId, previousId, newCreativeId, accessToken);
+
+  if (dryRun) {
+    return {
+      ...ids,
+      changed: false,
+      customization_rules_preserved: check.ok ? check.preserved : null,
+      ...dryRunField(check.ok ? null : check.refusal),
+    };
+  }
+  if (!check.ok) throw new Error(check.refusal);
+
+  await graphPost<AdUpdateResponse>(adId, accessToken, {
+    creative: JSON.stringify({ creative_id: newCreativeId }),
+  });
+  return { ...ids, changed: true, customization_rules_preserved: check.preserved };
 }
 
 /* ------------------------------------------------------------------------- */

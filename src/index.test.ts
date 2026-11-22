@@ -306,3 +306,54 @@ describe('create tools are PAUSED only (writes enabled)', () => {
     expect(fetchCalls[0]?.body.get('status')).toBe('ACTIVE');
   });
 });
+
+describe('meta_ads_rebind_ad_creative dry_run at the call site (writes enabled)', () => {
+  const OLD_CREATIVE = '120000000000041';
+
+  it('returns the refusal the real call would throw, as a result rather than an error, and writes nothing', async () => {
+    vi.stubEnv('META_ADS_MCP_WRITE', 'true');
+    // The ad sits on a creative with a per-placement image rule; the new creative has none.
+    const restore = fetchMock.getMockImplementation()!;
+    fetchMock.mockImplementation(async (input: string | URL | Request, init?: RequestInit) => {
+      const u = new URL(String(input));
+      fetchCalls.push({ url: u.toString(), method: init?.method ?? 'GET', body: new URLSearchParams(init?.body ? String(init.body) : '') });
+      const id = u.pathname.split('/').pop();
+      const body =
+        id === AD
+          ? { id: AD, name: 'Call-site ad', creative: { id: OLD_CREATIVE } }
+          : id === OLD_CREATIVE
+            ? { id, asset_feed_spec: { asset_customization_rules: [{ customization_spec: { publisher_platforms: ['facebook'] } }] } }
+            : { id };
+      return new Response(JSON.stringify(body), { status: 200, headers: { 'content-type': 'application/json' } });
+    });
+    try {
+      const dry = await client.callTool({
+        name: 'meta_ads_rebind_ad_creative',
+        arguments: { ad_id: AD, creative_id: CREATIVE, dry_run: true },
+      });
+      const real = await client.callTool({
+        name: 'meta_ads_rebind_ad_creative',
+        arguments: { ad_id: AD, creative_id: CREATIVE },
+      });
+
+      expect(dry.isError ?? false).toBe(false);
+      const out = JSON.parse(textOf(dry));
+      expect(Object.keys(out).sort()).toEqual([
+        'ad_id',
+        'ad_name',
+        'changed',
+        'customization_rules_preserved',
+        'new_creative_id',
+        'previous_creative_id',
+        'would_refuse',
+      ]);
+      expect(out).toMatchObject({ ad_id: AD, previous_creative_id: OLD_CREATIVE, new_creative_id: CREATIVE, changed: false });
+      expect(out.would_refuse).toMatch(/^Refusing to rebind ad /);
+      expect(real.isError).toBe(true);
+      expect(textOf(real)).toContain(out.would_refuse);
+      expect(fetchCalls.filter((c) => c.method === 'POST')).toEqual([]);
+    } finally {
+      fetchMock.mockImplementation(restore);
+    }
+  });
+});

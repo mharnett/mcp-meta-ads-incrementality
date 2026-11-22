@@ -522,13 +522,14 @@ function rebindMock(oldRules: unknown[] | GraphFail, newRules: unknown[] | Graph
 }
 
 describe('rebindAdCreative', () => {
-  it('dry run reads only the ad and sends no POST', async () => {
+  it('dry run runs the rule check, reports the refusal and sends no POST', async () => {
     const calls = rebindMock(RULES, []);
 
     const r = await rebindAdCreative('ad_1', 'cr_new', TOKEN, true);
 
-    expect(calls.map((c) => `${c.method} ${c.path}`)).toEqual(['GET ad_1']);
+    expect(calls.map((c) => `${c.method} ${c.path}`).sort()).toEqual(['GET ad_1', 'GET cr_new', 'GET cr_old']);
     expect(r.changed).toBe(false);
+    expect(r.would_refuse).toMatch(/^Refusing to rebind ad ad_1: previous creative cr_old has 2 asset_customization_rules/);
   });
 
   it('sends no POST when the ad is already on that creative', async () => {
