@@ -58,7 +58,10 @@ export function writeStoredCredentials(
   if (!existsSync(dir)) {
     mkdirSync(dir, { recursive: true });
   }
-  writeFileSync(filePath, JSON.stringify(creds, null, 2), { encoding: "utf-8" });
+  // Create the file 0600 so the token is never world-readable, not even
+  // between the write and the chmod. `mode` only applies when the file is
+  // created, so the chmod still tightens a file left by an older version.
+  writeFileSync(filePath, JSON.stringify(creds, null, 2), { encoding: "utf-8", mode: 0o600 });
   try { chmodSync(filePath, 0o600); } catch {}
 }
 

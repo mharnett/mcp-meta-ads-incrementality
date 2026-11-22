@@ -1,5 +1,13 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { rebindAdCreative } from './url-tags.js';
+import {
+  editCreativeText,
+  getAdUrlTags,
+  listAdsInCampaign,
+  rebindAdCreative,
+  renameAd,
+  swapAdLeadForm,
+  updateAdUrlTags,
+} from './url-tags.js';
 
 /**
  * Regression test for the 2026-05-14 RDR incident (commit 38b49f1).
@@ -77,5 +85,715 @@ describe('rebindAdCreative — asset_customization_rules safety check', () => {
     // through, the production data corruption already happened.
     const posts = calls.filter((c) => c.method === 'POST');
     expect(posts).toEqual([]);
+  });
+});
+
+/* ------------------------------------------------------------------------- */
+/* Routed Graph mock for the rest of the file                                */
+/* ------------------------------------------------------------------------- */
+/*
+ * Containment: url-tags.ts reaches Meta only through lib/graph.ts, which only
+ * calls global fetch. Every test below replaces fetch with a recorder, and the
+ * beforeEach default throws, so a test that forgets its mock fails instead of
+ * reaching graph.facebook.com. All ids and tokens are fakes.
+ */
+
+interface GraphCall {
+  method: string;
+  path: string;
+  query: Record<string, string>;
+  form: Record<string, string>;
+}
+
+class GraphFail {
+  constructor(public message: string, public code = 100) {}
+}
+
+type Reply = unknown | GraphFail;
+
+function graphMock(handler: (c: GraphCall) => Reply) {
+  const calls: GraphCall[] = [];
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async (input: string, init?: RequestInit) => {
+      const u = new URL(String(input));
+      const call: GraphCall = {
+        method: init?.method ?? 'GET',
+        path: u.pathname.replace(/^\/v\d+\.0\//, ''),
+        query: Object.fromEntries(u.searchParams),
+        form: init?.body ? Object.fromEntries(new URLSearchParams(String(init.body))) : {},
+      };
+      calls.push(call);
+      const out = handler(call);
+      if (out instanceof GraphFail) {
+        return new Response(JSON.stringify({ error: { message: out.message, code: out.code } }), { status: 400 });
+      }
+      return new Response(JSON.stringify(out ?? {}), { status: 200 });
+    }),
+  );
+  return calls;
+}
+
+const posts = (calls: GraphCall[]) => calls.filter((c) => c.method === 'POST');
+const json = (s: string | undefined) => JSON.parse(s ?? 'null');
+
+beforeEach(() => {
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async () => {
+      throw new Error('unexpected network call: no Graph mock installed');
+    }),
+  );
+});
+
+/* ------------------------------------------------------------------------- */
+/* listAdsInCampaign                                                         */
+/* ------------------------------------------------------------------------- */
+
+describe('listAdsInCampaign', () => {
+  it('follows cursors only while paging.next is present, then stops', async () => {
+    const calls = graphMock((c) => {
+      if (c.query.after === undefined) {
+        return {
+          data: [{ id: 'ad_1', name: 'One', status: 'ACTIVE', campaign_id: 'c_1', creative: { id: 'cr_1' } }],
+          paging: { cursors: { after: 'CUR1' }, next: 'https://graph.facebook.com/next' },
+        };
+      }
+      // Meta still returns cursors on the last page; only `next` is absent.
+      return {
+        data: [{ id: 'ad_2', name: 'Two', status: 'PAUSED', campaign_id: 'c_1' }],
+        paging: { cursors: { after: 'CUR2' } },
+      };
+    });
+
+    const ads = await listAdsInCampaign('c_1', TOKEN);
+
+    expect(calls.map((c) => [c.path, c.query.after])).toEqual([
+      ['c_1/ads', undefined],
+      ['c_1/ads', 'CUR1'],
+    ]);
+    expect(ads.map((a) => [a.id, a.creative_id])).toEqual([
+      ['ad_1', 'cr_1'],
+      ['ad_2', ''],
+    ]);
+  });
+});
+
+/* ------------------------------------------------------------------------- */
+/* getAdUrlTags / updateAdUrlTags                                            */
+/* ------------------------------------------------------------------------- */
+
+interface UrlTagsWorld {
+  creativeId: string;
+  urlTags: string | undefined;
+  objectStoryId?: string;
+  effectiveObjectStoryId?: string;
+  accountId?: string;
+  learningTs?: number;
+  learningTsAfterRebind?: number;
+  failLearning?: boolean;
+}
+
+function urlTagsMock(world: UrlTagsWorld) {
+  let rebound = false;
+  const calls = graphMock((c) => {
+    if (c.method === 'GET' && c.path === 'ad_1') {
+      return {
+        id: 'ad_1',
+        name: 'Spring promo',
+        account_id: world.accountId,
+        campaign_id: 'c_1',
+        adset_id: 'as_1',
+        campaign: { id: 'c_1', name: 'Test campaign' },
+        creative: rebound
+          ? { id: 'cr_new', url_tags: 'utm_source=new', object_story_id: world.objectStoryId }
+          : {
+              id: world.creativeId,
+              url_tags: world.urlTags,
+              object_story_id: world.objectStoryId,
+              effective_object_story_id: world.effectiveObjectStoryId,
+              object_story_spec: { link_data: { link: 'https://example.test/landing' } },
+            },
+      };
+    }
+    if (c.method === 'GET' && c.path === 'as_1') {
+      if (world.failLearning) return new GraphFail('learning_stage_info not available');
+      const ts = rebound && world.learningTsAfterRebind !== undefined ? world.learningTsAfterRebind : world.learningTs;
+      return { learning_stage_info: { status: 'SUCCESS', last_significant_edit_ts: ts } };
+    }
+    if (c.method === 'POST' && c.path.endsWith('/adcreatives')) return { id: 'cr_new' };
+    if (c.method === 'POST' && c.path === 'ad_1') {
+      rebound = true;
+      return { success: true };
+    }
+    return new GraphFail(`unrouted ${c.method} ${c.path}`);
+  });
+  return calls;
+}
+
+describe('getAdUrlTags', () => {
+  it('falls back to the video CTA link and to effective_object_story_id', async () => {
+    graphMock((c) => {
+      if (c.path === 'ad_9') {
+        return {
+          id: 'ad_9',
+          name: 'Video ad',
+          account_id: '111',
+          campaign_id: 'c_1',
+          creative: {
+            id: 'cr_9',
+            effective_object_story_id: 'page_1_post_9',
+            object_story_spec: { video_data: { call_to_action: { value: { link: 'https://example.test/video' } } } },
+          },
+        };
+      }
+      return new GraphFail('unrouted');
+    });
+
+    const info = await getAdUrlTags('ad_9', TOKEN);
+
+    expect(info.link).toBe('https://example.test/video');
+    expect(info.object_story_id).toBe('page_1_post_9');
+    expect(info.url_tags).toBeNull();
+    expect(info.learning_stage_info).toBeNull();
+  });
+
+  it('skips the ad set read when the ad has no adset_id', async () => {
+    const calls = graphMock(() => ({ id: 'ad_9', name: 'n', campaign_id: 'c_1', creative: { id: 'cr_9' } }));
+
+    await getAdUrlTags('ad_9', TOKEN);
+
+    expect(calls.map((c) => c.path)).toEqual(['ad_9']);
+  });
+});
+
+describe('updateAdUrlTags', () => {
+  const base: UrlTagsWorld = {
+    creativeId: 'cr_old',
+    urlTags: 'utm_source=old',
+    objectStoryId: 'page_1_post_1',
+    accountId: '111',
+    learningTs: 1_000,
+  };
+
+  it('dry run reports the change and sends no POST', async () => {
+    const calls = urlTagsMock(base);
+
+    const r = await updateAdUrlTags('ad_1', 'utm_source=new', TOKEN, true);
+
+    expect(posts(calls)).toEqual([]);
+    expect(r).toMatchObject({
+      previous_url_tags: 'utm_source=old',
+      new_url_tags: 'utm_source=new',
+      previous_creative_id: 'cr_old',
+      new_creative_id: '',
+      changed: true,
+      learning_after: null,
+      significant_edit_triggered: null,
+    });
+  });
+
+  it('sends no POST when the url_tags already match', async () => {
+    const calls = urlTagsMock(base);
+
+    const r = await updateAdUrlTags('ad_1', 'utm_source=old', TOKEN, false);
+
+    expect(posts(calls)).toEqual([]);
+    expect(r.changed).toBe(false);
+    expect(r.new_creative_id).toBe('cr_old');
+  });
+
+  it('refuses before any POST when the creative has no Page-post reference', async () => {
+    const calls = urlTagsMock({ ...base, objectStoryId: undefined });
+
+    await expect(updateAdUrlTags('ad_1', 'utm_source=new', TOKEN, false)).rejects.toThrow(/has no object_story_id/);
+    expect(posts(calls)).toEqual([]);
+  });
+
+  it('refuses before any POST when the ad read has no account_id', async () => {
+    const calls = urlTagsMock({ ...base, accountId: undefined });
+
+    await expect(updateAdUrlTags('ad_1', 'utm_source=new', TOKEN, false)).rejects.toThrow(/did not return account_id/);
+    expect(posts(calls)).toEqual([]);
+  });
+
+  it('creates a creative on the same Page post with the new tags, then rebinds the ad to it', async () => {
+    const calls = urlTagsMock(base);
+
+    const r = await updateAdUrlTags('ad_1', 'utm_source=new', TOKEN, false);
+
+    const [create, rebind, ...rest] = posts(calls);
+    expect(rest).toEqual([]);
+    expect(create?.path).toBe('act_111/adcreatives');
+    expect(create?.form.object_story_id).toBe('page_1_post_1');
+    expect(create?.form.url_tags).toBe('utm_source=new');
+    expect(rebind?.path).toBe('ad_1');
+    expect(json(rebind?.form.creative)).toEqual({ creative_id: 'cr_new' });
+    expect(r).toMatchObject({
+      previous_creative_id: 'cr_old',
+      new_creative_id: 'cr_new',
+      previous_url_tags: 'utm_source=old',
+      new_url_tags: 'utm_source=new',
+      changed: true,
+      significant_edit_triggered: false,
+    });
+  });
+
+  it('uses effective_object_story_id when object_story_id is absent', async () => {
+    const calls = urlTagsMock({ ...base, objectStoryId: undefined, effectiveObjectStoryId: 'page_1_post_7' });
+
+    await updateAdUrlTags('ad_1', 'utm_source=new', TOKEN, false);
+
+    expect(posts(calls)[0]?.form.object_story_id).toBe('page_1_post_7');
+  });
+
+  it('flags a significant edit when last_significant_edit_ts advances after the rebind', async () => {
+    urlTagsMock({ ...base, learningTsAfterRebind: 2_000 });
+
+    const r = await updateAdUrlTags('ad_1', 'utm_source=new', TOKEN, false);
+
+    expect(r.significant_edit_triggered).toBe(true);
+  });
+
+  it('reports significant_edit_triggered as unknown when learning info cannot be read', async () => {
+    urlTagsMock({ ...base, failLearning: true });
+
+    const r = await updateAdUrlTags('ad_1', 'utm_source=new', TOKEN, false);
+
+    expect(r.significant_edit_triggered).toBeNull();
+    expect(r.learning_before).toBeNull();
+  });
+});
+
+/* ------------------------------------------------------------------------- */
+/* swapAdLeadForm                                                            */
+/* ------------------------------------------------------------------------- */
+
+const RULES = [
+  { customization_spec: { publisher_platforms: ['facebook'] }, image_label: { name: 'fb' } },
+  { customization_spec: { publisher_platforms: ['instagram'] }, image_label: { name: 'ig' } },
+];
+
+function assetFeedCreative() {
+  return {
+    id: 'cr_old',
+    name: 'Old creative',
+    url_tags: 'utm_source=meta',
+    object_story_spec: { page_id: 'page_1', instagram_actor_id: 'ig_1' },
+    asset_feed_spec: {
+      images: [{ hash: 'h1' }, { hash: 'h2' }],
+      bodies: [{ text: 'Body A' }, { text: 'Body B' }],
+      titles: [{ text: 'Title A' }],
+      descriptions: [{ text: 'Desc A' }],
+      link_urls: [{ website_url: 'https://example.test/' }],
+      call_to_action_types: ['LEARN_MORE'],
+      call_to_actions: [{ type: 'LEARN_MORE', value: { lead_gen_form_id: 'form_old' } }],
+      ad_formats: ['AUTOMATIC_FORMAT'],
+      asset_customization_rules: RULES,
+    },
+  };
+}
+
+function legacyCreative(overrides: Record<string, unknown> = {}) {
+  return {
+    id: 'cr_old',
+    object_story_spec: {
+      page_id: 'page_1',
+      link_data: {
+        link: 'https://example.test/',
+        message: 'Primary text',
+        name: 'Headline',
+        description: 'Description',
+        image_hash: 'h1',
+        call_to_action: { type: 'SIGN_UP', value: { lead_gen_form_id: 'form_old' } },
+        ...overrides,
+      },
+    },
+  };
+}
+
+function swapMock(creative: unknown, accountId = '111') {
+  return graphMock((c) => {
+    if (c.method === 'GET' && c.path === 'ad_1') return { id: 'ad_1', name: 'Lead ad', account_id: accountId, creative };
+    if (c.method === 'POST' && c.path.endsWith('/adcreatives')) return { id: 'cr_new' };
+    if (c.method === 'POST' && c.path === 'ad_1') return { success: true };
+    return new GraphFail(`unrouted ${c.method} ${c.path}`);
+  });
+}
+
+describe('swapAdLeadForm', () => {
+  it('dry run reports the swap and sends no POST', async () => {
+    const calls = swapMock(assetFeedCreative());
+
+    const r = await swapAdLeadForm('ad_1', 'form_new', TOKEN, true);
+
+    expect(posts(calls)).toEqual([]);
+    expect(r).toMatchObject({ previous_form_id: 'form_old', new_form_id: 'form_new', mode: 'asset_feed_spec', changed: true, new_creative_id: '' });
+  });
+
+  it('sends no POST when the ad already uses the form', async () => {
+    const calls = swapMock(assetFeedCreative());
+
+    const r = await swapAdLeadForm('ad_1', 'form_old', TOKEN, false);
+
+    expect(posts(calls)).toEqual([]);
+    expect(r.changed).toBe(false);
+  });
+
+  it('asset-feed creative: carries every asset, the placement rules and url_tags into the new creative', async () => {
+    const calls = swapMock(assetFeedCreative(), 'act_111');
+
+    const r = await swapAdLeadForm('ad_1', 'form_new', TOKEN, false);
+
+    const [create, rebind, ...rest] = posts(calls);
+    expect(rest).toEqual([]);
+    expect(create?.path).toBe('act_111/adcreatives'); // no act_act_ doubling
+    expect(create?.form.url_tags).toBe('utm_source=meta');
+    expect(json(create?.form.object_story_spec)).toEqual({ page_id: 'page_1', instagram_actor_id: 'ig_1' });
+    const afs = json(create?.form.asset_feed_spec);
+    const old = assetFeedCreative().asset_feed_spec;
+    expect(afs.images).toEqual(old.images);
+    expect(afs.bodies).toEqual(old.bodies);
+    expect(afs.titles).toEqual(old.titles);
+    expect(afs.descriptions).toEqual(old.descriptions);
+    expect(afs.link_urls).toEqual(old.link_urls);
+    expect(afs.ad_formats).toEqual(old.ad_formats);
+    expect(afs.asset_customization_rules).toEqual(RULES);
+    expect(afs.call_to_action_types).toEqual(['LEARN_MORE']);
+    expect(afs.call_to_actions).toEqual([{ type: 'LEARN_MORE', value: { lead_gen_form_id: 'form_new' } }]);
+    expect(rebind?.path).toBe('ad_1');
+    expect(json(rebind?.form.creative)).toEqual({ creative_id: 'cr_new' });
+    expect(r).toMatchObject({ previous_creative_id: 'cr_old', new_creative_id: 'cr_new', changed: true });
+  });
+
+  it('legacy creative: rebuilds link_data with the new form and adds the act_ prefix', async () => {
+    const calls = swapMock(legacyCreative());
+
+    const r = await swapAdLeadForm('ad_1', 'form_new', TOKEN, false);
+
+    const create = posts(calls)[0];
+    expect(create?.path).toBe('act_111/adcreatives');
+    expect(json(create?.form.object_story_spec)).toEqual({
+      page_id: 'page_1',
+      link_data: {
+        link: 'https://example.test/',
+        message: 'Primary text',
+        name: 'Headline',
+        description: 'Description',
+        image_hash: 'h1',
+        call_to_action: { type: 'SIGN_UP', value: { lead_gen_form_id: 'form_new' } },
+      },
+    });
+    expect(r.mode).toBe('object_story_spec');
+  });
+
+  it('uses the CTA type override instead of the existing type', async () => {
+    const calls = swapMock(legacyCreative());
+
+    await swapAdLeadForm('ad_1', 'form_new', TOKEN, false, 'APPLY_NOW');
+
+    expect(json(posts(calls)[0]?.form.object_story_spec).link_data.call_to_action.type).toBe('APPLY_NOW');
+  });
+
+  it('refuses before any POST when a legacy creative lacks the primary text', async () => {
+    const calls = swapMock(legacyCreative({ message: undefined }));
+
+    await expect(swapAdLeadForm('ad_1', 'form_new', TOKEN, false)).rejects.toThrow(/missing page_id\/link\/message/);
+    expect(posts(calls)).toEqual([]);
+  });
+});
+
+/* ------------------------------------------------------------------------- */
+/* rebindAdCreative                                                          */
+/* ------------------------------------------------------------------------- */
+
+function rebindMock(oldRules: unknown[] | GraphFail, newRules: unknown[] | GraphFail) {
+  return graphMock((c) => {
+    if (c.method === 'GET' && c.path === 'ad_1') return { id: 'ad_1', name: 'Ad', creative: { id: 'cr_old' } };
+    if (c.method === 'GET' && c.path === 'cr_old') {
+      return oldRules instanceof GraphFail ? oldRules : { asset_feed_spec: { asset_customization_rules: oldRules } };
+    }
+    if (c.method === 'GET' && c.path === 'cr_new') {
+      return newRules instanceof GraphFail ? newRules : { asset_feed_spec: { asset_customization_rules: newRules } };
+    }
+    if (c.method === 'POST' && c.path === 'ad_1') return { success: true };
+    return new GraphFail(`unrouted ${c.method} ${c.path}`);
+  });
+}
+
+describe('rebindAdCreative', () => {
+  it('dry run reads only the ad and sends no POST', async () => {
+    const calls = rebindMock(RULES, []);
+
+    const r = await rebindAdCreative('ad_1', 'cr_new', TOKEN, true);
+
+    expect(calls.map((c) => `${c.method} ${c.path}`)).toEqual(['GET ad_1']);
+    expect(r.changed).toBe(false);
+  });
+
+  it('sends no POST when the ad is already on that creative', async () => {
+    const calls = rebindMock(RULES, []);
+
+    const r = await rebindAdCreative('ad_1', 'cr_old', TOKEN, false);
+
+    expect(posts(calls)).toEqual([]);
+    expect(r.changed).toBe(false);
+  });
+
+  it('rebinds and reports the rules preserved when the new creative carries them', async () => {
+    const calls = rebindMock(RULES, RULES);
+
+    const r = await rebindAdCreative('ad_1', 'cr_new', TOKEN, false);
+
+    expect(posts(calls).map((c) => json(c.form.creative))).toEqual([{ creative_id: 'cr_new' }]);
+    expect(r).toMatchObject({ changed: true, customization_rules_preserved: true });
+  });
+
+  it('reports a partial rule drop as not preserved', async () => {
+    rebindMock(RULES, [RULES[0]]);
+
+    const r = await rebindAdCreative('ad_1', 'cr_new', TOKEN, false);
+
+    expect(r.customization_rules_preserved).toBe(false);
+  });
+
+  it('refuses when the new creative’s rules cannot be read and the old creative has rules', async () => {
+    const calls = rebindMock(RULES, new GraphFail('permission denied'));
+
+    await expect(rebindAdCreative('ad_1', 'cr_new', TOKEN, false)).rejects.toThrow(/Refusing to rebind/);
+    expect(posts(calls)).toEqual([]);
+  });
+
+  it('force=true skips the rule check and rebinds', async () => {
+    const calls = rebindMock(RULES, []);
+
+    const r = await rebindAdCreative('ad_1', 'cr_new', TOKEN, false, true);
+
+    expect(calls.filter((c) => c.method === 'GET').map((c) => c.path)).toEqual(['ad_1']);
+    expect(posts(calls)).toHaveLength(1);
+    expect(r).toMatchObject({ changed: true, customization_rules_preserved: null });
+  });
+});
+
+/* ------------------------------------------------------------------------- */
+/* editCreativeText                                                          */
+/* ------------------------------------------------------------------------- */
+
+interface EditWorld {
+  creative: Record<string, unknown>;
+  ctas?: unknown[] | GraphFail;
+  newCreativeRules?: unknown[];
+}
+
+function editMock(world: EditWorld) {
+  let rebound = false;
+  return graphMock((c) => {
+    if (c.method === 'GET' && c.path === 'ad_1') {
+      const fields = c.query.fields ?? '';
+      if (fields === 'creative{asset_feed_spec{call_to_actions}}') {
+        if (world.ctas instanceof GraphFail) return world.ctas;
+        return { creative: { asset_feed_spec: { call_to_actions: world.ctas ?? [] } } };
+      }
+      if (fields === 'id,name,creative{id}') {
+        return { id: 'ad_1', name: 'Ad', creative: { id: rebound ? 'cr_new' : 'cr_old' } };
+      }
+      return { id: 'ad_1', name: 'Ad', account_id: '111', creative: world.creative };
+    }
+    if (c.method === 'GET' && c.path === 'cr_old') {
+      const afs = world.creative.asset_feed_spec as { asset_customization_rules?: unknown[] } | undefined;
+      return { asset_feed_spec: { asset_customization_rules: afs?.asset_customization_rules ?? [] } };
+    }
+    if (c.method === 'GET' && c.path === 'cr_new') {
+      return { asset_feed_spec: { asset_customization_rules: world.newCreativeRules ?? [] } };
+    }
+    if (c.method === 'POST' && c.path === 'act_111/adcreatives') return { id: 'cr_new' };
+    if (c.method === 'POST' && c.path === 'ad_1') {
+      rebound = true;
+      return { success: true };
+    }
+    return new GraphFail(`unrouted ${c.method} ${c.path}`);
+  });
+}
+
+function dcoCreative(rules: unknown[] = RULES) {
+  return {
+    id: 'cr_old',
+    name: 'DCO creative',
+    url_tags: 'utm_source=meta',
+    instagram_user_id: 'ig_user_1',
+    object_story_spec: { page_id: 'page_1' },
+    asset_feed_spec: {
+      // Meta returns one entry per (asset, adlabel) pair.
+      images: [
+        { hash: 'h1', adlabels: [{ name: 'fb' }] },
+        { hash: 'h1', adlabels: [{ name: 'ig' }] },
+        { hash: 'h2', adlabels: [{ name: 'fb' }] },
+      ],
+      videos: [{ video_id: 'v1', thumbnail_url: 'https://example.test/t.jpg' }],
+      bodies: [{ text: 'Body A' }, { text: 'Body B' }],
+      titles: [{ text: 'Title A', adlabels: [{ name: 't1' }] }, { text: 'Title B' }],
+      descriptions: [{ text: 'Desc A' }],
+      link_urls: [{ website_url: 'https://example.test/' }],
+      call_to_action_types: ['LEARN_MORE'],
+      ad_formats: ['AUTOMATIC_FORMAT'],
+      optimization_type: 'PLACEMENT',
+      asset_customization_rules: rules,
+    },
+  };
+}
+
+describe('editCreativeText', () => {
+  it('refuses an empty edit before touching the API', async () => {
+    const calls = editMock({ creative: dcoCreative() });
+
+    await expect(editCreativeText('ad_1', {}, TOKEN, false)).rejects.toThrow(/provide at least one/);
+    expect(calls).toEqual([]);
+  });
+
+  it('asset-feed: swaps only the edited text, keeps adlabels by index, and keeps images, videos and rules', async () => {
+    const calls = editMock({
+      creative: dcoCreative(),
+      ctas: [{ type: 'LEARN_MORE', value: { link: 'https://example.test/' } }],
+      newCreativeRules: RULES,
+    });
+
+    const r = await editCreativeText('ad_1', { headlines: ['New A', 'New B'] }, TOKEN, false);
+
+    const create = posts(calls).find((c) => c.path === 'act_111/adcreatives');
+    expect(create?.form.url_tags).toBe('utm_source=meta');
+    expect(create?.form.instagram_user_id).toBe('ig_user_1');
+    const afs = json(create?.form.asset_feed_spec);
+    expect(afs.titles).toEqual([{ text: 'New A', adlabels: [{ name: 't1' }] }, { text: 'New B' }]);
+    expect(afs.bodies).toEqual(dcoCreative().asset_feed_spec.bodies);
+    expect(afs.descriptions).toEqual(dcoCreative().asset_feed_spec.descriptions);
+    // Duplicate (asset, label) rows merge into one asset per hash (subcode 1815629).
+    expect(afs.images).toEqual([
+      { hash: 'h1', adlabels: [{ name: 'fb' }, { name: 'ig' }] },
+      { hash: 'h2', adlabels: [{ name: 'fb' }] },
+    ]);
+    expect(afs.videos).toHaveLength(1);
+    expect(afs.videos[0]).toMatchObject({ video_id: 'v1', thumbnail_url: 'https://example.test/t.jpg' });
+    expect(afs.asset_customization_rules).toEqual(RULES);
+    expect(afs.call_to_actions).toEqual([{ type: 'LEARN_MORE', value: { link: 'https://example.test/' } }]);
+    expect(afs.optimization_type).toBe('PLACEMENT');
+    expect(r).toMatchObject({ mode: 'asset_feed_spec', changed_fields: ['headlines'], new_creative_id: 'cr_new', customization_rules_preserved: 2 });
+    // The rebind goes through rebindAdCreative's rule check (both creatives'
+    // rules are read, so no force), then one POST.
+    const ruleReads = calls.filter((c) => c.method === 'GET' && c.query.fields === 'asset_feed_spec{asset_customization_rules}');
+    expect(ruleReads.map((c) => c.path).sort()).toEqual(['cr_new', 'cr_old']);
+    const rebinds = posts(calls).filter((c) => c.path === 'ad_1');
+    expect(rebinds.map((c) => json(c.form.creative))).toEqual([{ creative_id: 'cr_new' }]);
+  });
+
+  it('asset-feed: carries on without call_to_actions when Meta denies that read', async () => {
+    const calls = editMock({ creative: dcoCreative(), ctas: new GraphFail('permission denied'), newCreativeRules: RULES });
+
+    await editCreativeText('ad_1', { messages: ['New body A', 'New body B'] }, TOKEN, false);
+
+    const afs = json(posts(calls)[0]?.form.asset_feed_spec);
+    expect(afs.call_to_actions).toBeUndefined();
+    expect(afs.call_to_action_types).toEqual(['LEARN_MORE']);
+  });
+
+  it('asset-feed: refuses a count change that would orphan body_label rules, before any POST', async () => {
+    const labelRules = [{ customization_spec: { publisher_platforms: ['facebook'] }, body_label: { name: 'b1' } }];
+    const calls = editMock({ creative: dcoCreative(labelRules) });
+
+    await expect(editCreativeText('ad_1', { messages: ['Only one'] }, TOKEN, false)).rejects.toThrow(
+      /Refusing to edit messages.*body_label/s,
+    );
+    expect(posts(calls)).toEqual([]);
+  });
+
+  it('asset-feed: force=true allows that count change', async () => {
+    const labelRules = [{ customization_spec: { publisher_platforms: ['facebook'] }, body_label: { name: 'b1' } }];
+    const calls = editMock({ creative: dcoCreative(labelRules), newCreativeRules: labelRules });
+
+    await editCreativeText('ad_1', { messages: ['Only one'] }, TOKEN, false, true);
+
+    expect(json(posts(calls)[0]?.form.asset_feed_spec).bodies).toEqual([{ text: 'Only one' }]);
+  });
+
+  it('dry run lists the changed fields and sends no POST', async () => {
+    const calls = editMock({ creative: dcoCreative() });
+
+    const r = await editCreativeText('ad_1', { headlines: ['A', 'B'] }, TOKEN, true);
+
+    expect(posts(calls)).toEqual([]);
+    expect(r).toMatchObject({ changed_fields: ['headlines'], new_creative_id: '' });
+  });
+
+  it('legacy: replaces the headline and keeps link, message, image and CTA', async () => {
+    const calls = editMock({ creative: legacyCreative() });
+
+    const r = await editCreativeText('ad_1', { headlines: ['New headline'] }, TOKEN, false);
+
+    const create = posts(calls).find((c) => c.path === 'act_111/adcreatives');
+    expect(json(create?.form.object_story_spec)).toEqual({
+      page_id: 'page_1',
+      link_data: { ...legacyCreative().object_story_spec.link_data, name: 'New headline' },
+    });
+    expect(r).toMatchObject({ mode: 'object_story_spec', changed_fields: ['headlines'], new_creative_id: 'cr_new' });
+  });
+
+  it('legacy: refuses more than one headline before any POST', async () => {
+    const calls = editMock({ creative: legacyCreative() });
+
+    await expect(editCreativeText('ad_1', { headlines: ['A', 'B'] }, TOKEN, false)).rejects.toThrow(/single-variant/);
+    expect(posts(calls)).toEqual([]);
+  });
+
+  it('legacy: sends no POST when every edit array is empty', async () => {
+    const calls = editMock({ creative: legacyCreative() });
+
+    const r = await editCreativeText('ad_1', { headlines: [], messages: [] }, TOKEN, false);
+
+    expect(posts(calls)).toEqual([]);
+    expect(r).toMatchObject({ changed_fields: [], new_creative_id: 'cr_old' });
+  });
+});
+
+/* ------------------------------------------------------------------------- */
+/* renameAd                                                                  */
+/* ------------------------------------------------------------------------- */
+
+describe('renameAd', () => {
+  function renameMock() {
+    let name = 'Old name';
+    return graphMock((c) => {
+      if (c.method === 'GET' && c.path === 'ad_1') return { id: 'ad_1', name };
+      if (c.method === 'POST' && c.path === 'ad_1') {
+        name = c.form.name ?? name;
+        return { success: true };
+      }
+      return new GraphFail(`unrouted ${c.method} ${c.path}`);
+    });
+  }
+
+  it('dry run reports the rename and sends no POST', async () => {
+    const calls = renameMock();
+
+    const r = await renameAd('ad_1', 'New name', TOKEN, true);
+
+    expect(posts(calls)).toEqual([]);
+    expect(r).toEqual({ ad_id: 'ad_1', previous_name: 'Old name', new_name: 'New name', changed: true });
+  });
+
+  it('sends no POST when the name already matches', async () => {
+    const calls = renameMock();
+
+    const r = await renameAd('ad_1', 'Old name', TOKEN, false);
+
+    expect(posts(calls)).toEqual([]);
+    expect(r.changed).toBe(false);
+  });
+
+  it('posts the new name and reports what the read-back shows', async () => {
+    const calls = renameMock();
+
+    const r = await renameAd('ad_1', 'New name', TOKEN, false);
+
+    expect(posts(calls).map((c) => c.form.name)).toEqual(['New name']);
+    expect(r).toEqual({ ad_id: 'ad_1', previous_name: 'Old name', new_name: 'New name', changed: true });
   });
 });
