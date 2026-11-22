@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { rebindAdCreative } from './url-tags.js';
+import { rebindAdCreative, type RebindAdCreativeResult } from './url-tags.js';
 
 /**
  * rebindAdCreative must fail closed when it cannot read the current creative's
@@ -95,6 +95,25 @@ function world(oldRead: Reply, newRead: Reply, adBody: unknown = { id: AD, name:
 
 const rules = (r: unknown[]): Reply => ({ body: { id: 'x', asset_feed_spec: { asset_customization_rules: r } } });
 
+// The ways a real read fails: Graph errors (permission, rate limit,
+// transient), an error body on HTTP 200, a non-JSON gateway page, and a
+// dropped connection.
+const failedReads: Array<[string, Reply, RegExp]> = [
+  ['permission denied (code 10)', { graphError: { message: 'Application does not have permission for this action', code: 10 } }, /does not have permission/],
+  ['rate limited (code 17)', { graphError: { message: 'User request limit reached', code: 17 } }, /User request limit reached/],
+  ['transient Graph error (code 2)', { graphError: { message: 'Service temporarily unavailable', code: 2 }, status: 500 }, /temporarily unavailable/],
+  ['error body on HTTP 200', { graphError: { message: 'An unknown error occurred', code: 1 }, status: 200 }, /unknown error/],
+  ['non-JSON 502 gateway page', { raw: '<html>502 Bad Gateway</html>', status: 502 }, /not valid JSON|Unexpected token/],
+  ['network error', { networkError: 'fetch failed' }, /fetch failed/],
+];
+
+// DCO and single-image creatives: a successful read with nothing to drop.
+const emptyReads: Array<[string, Reply]> = [
+  ['no asset_feed_spec at all', { body: { id: OLD } }],
+  ['asset_feed_spec without asset_customization_rules', { body: { id: OLD, asset_feed_spec: {} } }],
+  ['an empty asset_customization_rules array', rules([])],
+];
+
 beforeEach(() => {
   vi.stubGlobal(
     'fetch',
@@ -106,18 +125,6 @@ beforeEach(() => {
 afterEach(() => vi.unstubAllGlobals());
 
 describe('rebindAdCreative fails closed when the current creative’s placement rules cannot be read', () => {
-  // The ways a real read fails: Graph errors (permission, rate limit,
-  // transient), an error body on HTTP 200, a non-JSON gateway page, and a
-  // dropped connection.
-  const failedReads: Array<[string, Reply, RegExp]> = [
-    ['permission denied (code 10)', { graphError: { message: 'Application does not have permission for this action', code: 10 } }, /does not have permission/],
-    ['rate limited (code 17)', { graphError: { message: 'User request limit reached', code: 17 } }, /User request limit reached/],
-    ['transient Graph error (code 2)', { graphError: { message: 'Service temporarily unavailable', code: 2 }, status: 500 }, /temporarily unavailable/],
-    ['error body on HTTP 200', { graphError: { message: 'An unknown error occurred', code: 1 }, status: 200 }, /unknown error/],
-    ['non-JSON 502 gateway page', { raw: '<html>502 Bad Gateway</html>', status: 502 }, /not valid JSON|Unexpected token/],
-    ['network error', { networkError: 'fetch failed' }, /fetch failed/],
-  ];
-
   it.each(failedReads)('%s on the old creative: refuses and sends no POST', async (_label, oldRead, cause) => {
     // The incident's new creative: base image only, no placement rules.
     const calls = world(oldRead, rules([]));
@@ -177,13 +184,6 @@ describe('rebindAdCreative fails closed when the current creative’s placement 
 });
 
 describe('rebindAdCreative still rebinds when the read succeeds and finds no rules', () => {
-  // DCO and single-image creatives: a successful read with nothing to drop.
-  const emptyReads: Array<[string, Reply]> = [
-    ['no asset_feed_spec at all', { body: { id: OLD } }],
-    ['asset_feed_spec without asset_customization_rules', { body: { id: OLD, asset_feed_spec: {} } }],
-    ['an empty asset_customization_rules array', rules([])],
-  ];
-
   it.each(emptyReads)('%s: rebinds once and reports nothing to preserve', async (_label, oldRead) => {
     const calls = world(oldRead, rules([]));
 
@@ -218,5 +218,121 @@ describe('rebindAdCreative still rebinds when the read succeeds and finds no rul
 
     expect(posts(calls)).toHaveLength(1);
     expect(r).toMatchObject({ changed: true, customization_rules_preserved: true });
+  });
+});
+
+/**
+ * dry_run=true must run the same rule check and report what the real run
+ * would refuse. It used to return straight after the ad read, so a preview of
+ * a rebind that would drop every per-placement image rule (or could not read
+ * them) came back clean, and the refusal only showed up on the live call.
+ *
+ * Each scenario runs the real call and the dry run against the same fake
+ * Graph: the dry run's `would_refuse` must be the exact message the real run
+ * throws, or null when the real run goes ahead.
+ */
+describe('dry_run reports what the real run would refuse', () => {
+  type Outcome = { refused: string } | { rebound: RebindAdCreativeResult };
+
+  async function realRun(setup: () => Call[], force = false): Promise<Outcome> {
+    setup();
+    try {
+      return { rebound: await rebindAdCreative(AD, NEW, TOKEN, false, force) };
+    } catch (e) {
+      return { refused: (e as Error).message };
+    }
+  }
+
+  const gets = (calls: Call[]) =>
+    calls.filter((c) => c.method === 'GET').map((c) => `${c.path}${c.fields ? ` ${c.fields}` : ''}`);
+
+  const refusals: Array<[string, () => Call[]]> = [
+    ...failedReads.map(([label, oldRead]): [string, () => Call[]] => [
+      `old creative's read fails (${label})`,
+      () => world(oldRead, rules([])),
+    ]),
+    ['old creative has rules, new creative has none', () => world(rules(PLACEMENT_RULES), rules([]))],
+    [
+      'old creative has rules, new creative’s read fails',
+      () => world(rules(PLACEMENT_RULES), { graphError: { message: 'Unsupported get request', code: 100 } }),
+    ],
+    ['the ad read returns no current creative', () => world(rules(PLACEMENT_RULES), rules([]), { id: AD, name: 'Feed ad' })],
+  ];
+
+  it.each(refusals)('%s: the dry run reports the real refusal and sends no POST', async (_label, setup) => {
+    const real = await realRun(setup);
+    expect(real).toEqual({ refused: expect.stringMatching(/^Refusing to rebind ad ad_1: /) });
+
+    const calls = setup();
+    const r = await rebindAdCreative(AD, NEW, TOKEN, true);
+
+    expect(r.would_refuse).toBe((real as { refused: string }).refused);
+    expect(r).toMatchObject({ ad_id: AD, new_creative_id: NEW, changed: false, customization_rules_preserved: null });
+    expect(posts(calls)).toEqual([]);
+  });
+
+  const goAheads: Array<[string, () => Call[]]> = [
+    ...emptyReads.map(([label, oldRead]): [string, () => Call[]] => [
+      `old creative has no rules (${label})`,
+      () => world(oldRead, rules([])),
+    ]),
+    ['old creative has no rules, new creative’s read fails', () => world({ body: { id: OLD } }, { graphError: { message: 'permission denied', code: 10 } })],
+    ['old and new both carry the rules', () => world(rules(PLACEMENT_RULES), rules(PLACEMENT_RULES))],
+    ['new creative carries only some of the rules', () => world(rules(PLACEMENT_RULES), rules(PLACEMENT_RULES.slice(0, 1)))],
+  ];
+
+  it.each(goAheads)('%s: the dry run reports no refusal and the real run’s preserved value', async (_label, setup) => {
+    const real = await realRun(setup);
+    expect(real).toHaveProperty('rebound');
+
+    const calls = setup();
+    const r = await rebindAdCreative(AD, NEW, TOKEN, true);
+
+    expect(r).toEqual({ ...(real as { rebound: RebindAdCreativeResult }).rebound, changed: false, would_refuse: null });
+    expect(gets(calls)).toContain(`${OLD} ${RULES_FIELDS}`); // the check ran
+    expect(posts(calls)).toEqual([]);
+  });
+
+  it('force=true: like the real run, the dry run skips the check and reports no refusal', async () => {
+    const setup = () => world(rules(PLACEMENT_RULES), rules([]));
+    expect(await realRun(setup)).toHaveProperty('refused'); // without force this would be refused
+
+    const realCalls = setup();
+    await rebindAdCreative(AD, NEW, TOKEN, false, true);
+    const calls = setup();
+    const r = await rebindAdCreative(AD, NEW, TOKEN, true, true);
+
+    expect(r).toMatchObject({ changed: false, would_refuse: null, customization_rules_preserved: null });
+    expect(gets(calls)).toEqual(gets(realCalls));
+    expect(posts(calls)).toEqual([]);
+  });
+
+  it('the ad is already on that creative: nothing to check, nothing to refuse', async () => {
+    const calls = world(rules(PLACEMENT_RULES), rules([]));
+
+    const r = await rebindAdCreative(AD, OLD, TOKEN, true);
+
+    expect(r).toEqual({
+      ad_id: AD,
+      ad_name: 'Feed ad',
+      previous_creative_id: OLD,
+      new_creative_id: OLD,
+      changed: false,
+      customization_rules_preserved: null,
+      would_refuse: null,
+    });
+    expect(gets(calls)).toEqual([`${AD} id,name,creative{id}`]);
+  });
+
+  it('a real run carries no would_refuse field, whether it rebinds or the ad is already on that creative', async () => {
+    world(rules(PLACEMENT_RULES), rules(PLACEMENT_RULES));
+
+    const rebound = await rebindAdCreative(AD, NEW, TOKEN, false);
+    const noop = await rebindAdCreative(AD, OLD, TOKEN, false);
+
+    expect(rebound).toMatchObject({ changed: true });
+    expect(rebound).not.toHaveProperty('would_refuse');
+    expect(noop).toMatchObject({ changed: false });
+    expect(noop).not.toHaveProperty('would_refuse');
   });
 });

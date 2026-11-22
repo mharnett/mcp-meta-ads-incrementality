@@ -583,13 +583,21 @@ const TOOL_REBIND_AD_CREATIVE = {
     'without losing performance history on the ad object. SAFETY: refuses to rebind when the ' +
     'old creative has asset_customization_rules (per-placement image rules) and the new one ' +
     'does not, and also when it cannot read the old creative\'s rules (a failed read is never ' +
-    'treated as "no rules") — pass force=true to override. Pass dry_run=true to preview.',
+    'treated as "no rules") — pass force=true to override. Pass dry_run=true to preview: it runs ' +
+    'the same check without writing and returns would_refuse, the refusal the real call would ' +
+    'give, or null if it would go ahead.',
   inputSchema: {
     type: 'object',
     properties: {
       ad_id: { type: 'string', description: 'Meta ad id (numeric).' },
       creative_id: { type: 'string', description: 'New creative_id to bind to the ad.' },
-      dry_run: { type: 'boolean', description: 'If true, return a diff without writing. Default false.' },
+      dry_run: {
+        type: 'boolean',
+        description:
+          'If true, run the placement-rule safety check and return the result without writing: ' +
+          'would_refuse is the refusal the real call would give, or null if it would go ahead. ' +
+          'Default false.',
+      },
       force: {
         type: 'boolean',
         description: 'Bypass the asset_customization_rules safety check. Use only when intentionally replacing per-placement image rules.',
