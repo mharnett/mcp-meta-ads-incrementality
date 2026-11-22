@@ -336,24 +336,37 @@ interface CreativeReadFull {
 }
 
 /**
- * Fetch asset_customization_rules for a creative. Returns the raw array (may be
- * empty/undefined). Used by the rebind safety check — these are the per-placement
- * image rules that get silently dropped if the create-then-rebind path doesn't
- * carry them through.
+ * Result of reading a creative's asset_customization_rules. A failed read is
+ * kept apart from a successful read that found no rules: only the second means
+ * "nothing to drop". Treating a failed read as `[]` let a rebind drop
+ * per-placement image rules it never saw.
+ */
+type CustomizationRulesRead =
+  | { ok: true; rules: unknown[] }
+  | { ok: false; error: string };
+
+/**
+ * Fetch asset_customization_rules for a creative. Used by the rebind safety
+ * check — these are the per-placement image rules that get silently dropped if
+ * the create-then-rebind path doesn't carry them through.
+ *
+ * A successful read with no asset_feed_spec, or one without rules, is `ok` with
+ * `rules: []` (DCO and single-image creatives often return nothing here). Any
+ * Graph error, non-JSON body or network error is `ok: false`.
  */
 async function fetchCustomizationRules(
   creativeId: string,
   accessToken: string,
-): Promise<unknown[]> {
+): Promise<CustomizationRulesRead> {
   try {
     const r = await graphGet<{ asset_feed_spec?: { asset_customization_rules?: unknown[] } }>(
       creativeId,
       accessToken,
       { fields: 'asset_feed_spec{asset_customization_rules}' },
     );
-    return r.asset_feed_spec?.asset_customization_rules ?? [];
-  } catch {
-    return [];
+    return { ok: true, rules: r.asset_feed_spec?.asset_customization_rules ?? [] };
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : String(e) };
   }
 }
 
@@ -523,10 +536,17 @@ export interface RebindAdCreativeResult {
  *
  * Safety check: if the OLD creative has `asset_customization_rules` (per-placement
  * image rules set in Ads Manager UI) and the NEW creative does not carry them
- * forward, the rebind is REFUSED. This catches the 2026-05-14 RDR class of bug
+ * forward, the rebind is REFUSED. This catches the 2026-05-14 class of bug
  * where multi-variant headline writes silently flattened custom placements by image.
+ *
+ * The check fails closed: the rebind is also REFUSED when the ad read returns no
+ * current creative, when the old creative's rules can't be read, or when the old
+ * creative has rules and the new creative's can't be read. A failed read is never
+ * taken to mean "no rules". A successful read that finds none (common on DCO and
+ * single-image creatives) is "no rules", and the rebind goes ahead.
+ *
  * Pass `force=true` to override (e.g. when the new creative deliberately replaces
- * the placement rules).
+ * the placement rules, or a failed read has been checked by hand in Ads Manager).
  */
 export async function rebindAdCreative(
   adId: string,
@@ -553,11 +573,42 @@ export async function rebindAdCreative(
   }
 
   let preserved: boolean | null = null;
-  if (previousId && !force) {
-    const [oldRules, newRules] = await Promise.all([
+  if (!force) {
+    if (!previousId) {
+      throw new Error(
+        `Refusing to rebind ad ${adId}: the ad read returned no current creative, so there is ` +
+        `no way to check whether this rebind would drop per-placement image rules ` +
+        `(asset_customization_rules). Nothing was changed. Retry; if it keeps happening, open ` +
+        `the ad in Ads Manager and check whether its images are customized by placement. Pass ` +
+        `force=true only once you have confirmed it has none, or that dropping them is intentional.`,
+      );
+    }
+    const [oldRead, newRead] = await Promise.all([
       fetchCustomizationRules(previousId, accessToken),
       fetchCustomizationRules(newCreativeId, accessToken),
     ]);
+    if (!oldRead.ok) {
+      throw new Error(
+        `Refusing to rebind ad ${adId}: could not read the placement rules ` +
+        `(asset_customization_rules) on its current creative ${previousId}, so there is no way ` +
+        `to tell whether this rebind would drop them. Nothing was changed. Read error: ` +
+        `${oldRead.error}. To proceed: (a) retry, since the error may be transient; (b) if it ` +
+        `keeps failing, open the ad in Ads Manager and check whether its images are customized ` +
+        `by placement, and if they are, make the change there; (c) pass force=true only once you ` +
+        `have confirmed the ad has no placement rules, or that dropping them is intentional.`,
+      );
+    }
+    const oldRules = oldRead.rules;
+    if (oldRules.length > 0 && !newRead.ok) {
+      throw new Error(
+        `Refusing to rebind ad ${adId}: current creative ${previousId} has ${oldRules.length} ` +
+        `asset_customization_rules (per-placement image rules set in Ads Manager UI), and this ` +
+        `tool could not read the rules on new creative ${newCreativeId}, so it can't confirm they ` +
+        `carry over. Nothing was changed. Read error: ${newRead.error}. Retry, or pass force=true ` +
+        `once you have confirmed the new creative carries the rules or the drop is intentional.`,
+      );
+    }
+    const newRules = newRead.ok ? newRead.rules : [];
     if (oldRules.length > 0 && newRules.length === 0) {
       throw new Error(
         `Refusing to rebind ad ${adId}: previous creative ${previousId} has ${oldRules.length} ` +
