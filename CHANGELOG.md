@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.4.2](https://github.com/mharnett/mcp-meta-ads-incrementality/compare/mcp-meta-ads-incrementality-v0.4.1...mcp-meta-ads-incrementality-v0.4.2) (2026-11-22)
+
+
+### Bug Fixes
+
+* create tools refuse any status but PAUSED, and test the write gate at its call site ([#20](https://github.com/mharnett/mcp-meta-ads-incrementality/issues/20)) ([ad006d4](https://github.com/mharnett/mcp-meta-ads-incrementality/commit/ad006d4da7c59a02954b143751da2d7cea7023d0))
+* rebind dry run reports what the real run would refuse ([#25](https://github.com/mharnett/mcp-meta-ads-incrementality/issues/25)) ([12c01ab](https://github.com/mharnett/mcp-meta-ads-incrementality/commit/12c01aba244009ae991921cd8f2a148052649726))
+* rebind refuses when it can't read the old creative's placement rules ([#24](https://github.com/mharnett/mcp-meta-ads-incrementality/issues/24)) ([5d9b00b](https://github.com/mharnett/mcp-meta-ads-incrementality/commit/5d9b00b47f82923f5a0e3618a842801ebdf0fbc5))
+
 ## [0.4.1](https://github.com/mharnett/mcp-meta-ads-incrementality/compare/mcp-meta-ads-incrementality-v0.4.0...mcp-meta-ads-incrementality-v0.4.1) (2026-11-10)
 
 
