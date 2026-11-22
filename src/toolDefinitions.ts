@@ -582,7 +582,8 @@ const TOOL_REBIND_AD_CREATIVE = {
     'meta_ads_create_ad_creative to do full ad rebuilds (e.g. swap form + rebuild text content) ' +
     'without losing performance history on the ad object. SAFETY: refuses to rebind when the ' +
     'old creative has asset_customization_rules (per-placement image rules) and the new one ' +
-    'does not — pass force=true to override. Pass dry_run=true to preview.',
+    'does not, and also when it cannot read the old creative\'s rules (a failed read is never ' +
+    'treated as "no rules") — pass force=true to override. Pass dry_run=true to preview.',
   inputSchema: {
     type: 'object',
     properties: {
