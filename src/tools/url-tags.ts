@@ -9,13 +9,14 @@
  * Update strategy: create-then-rebind. We tried `POST /{ad-id}` with an
  * inline creative override (`creative={creative_id, url_tags}`) — Meta returns
  * success but silently no-ops, leaving the ad on the original creative.
- * Verified empirically on ad 120243275305000447 (2026-05-05): POST returned
- * success, read-back showed url_tags unchanged. Meta creatives are effectively
+ * Verified empirically on a live ad (2026-05-05): POST returned success,
+ * read-back showed url_tags unchanged. Meta creatives are effectively
  * immutable, so the working pattern is:
  *   1. Read the existing creative's object_story_id (Page-post reference).
  *   2. POST /act_X/adcreatives with same object_story_id + new url_tags →
  *      yields a new creative_id.
- *   3. POST /{ad-id} with creative_id=<new> to rebind.
+ *   3. Rebind the ad to the new creative through rebindAdCreative, so the
+ *      placement-rule check runs first.
  * The ad-id is unchanged. Meta may briefly re-review the ad.
  */
 import { graphGet, graphPost } from '../lib/graph.js';
@@ -199,7 +200,9 @@ interface CreativeCreateResponse {
  *   2. POST /act_X/adcreatives with {object_story_id, url_tags,
  *      object_story_spec.use_page_actor_override flag implicit} — same
  *      Page-post reference, only url_tags differs.
- *   3. POST /{ad-id} with creative_id=<new>.
+ *   3. Rebind the ad to <new> through rebindAdCreative's placement-rule check.
+ *      The new creative is built from the Page post alone, so an ad whose
+ *      per-placement image rules don't carry over is refused, not flattened.
  *   4. Re-read learning_stage_info; compare last_significant_edit_ts.
  *
  * If last_significant_edit_ts is unchanged, Meta did not consider the edit
@@ -265,9 +268,7 @@ export async function updateAdUrlTags(
     },
   );
 
-  await graphPost<AdUpdateResponse>(adId, accessToken, {
-    creative: JSON.stringify({ creative_id: created.id }),
-  });
+  await rebindCreatedCreative(adId, created.id, accessToken);
 
   const after = await getAdUrlTags(adId, accessToken);
   const beforeTs = before.learning_stage_info?.last_significant_edit_ts ?? null;
@@ -385,7 +386,7 @@ interface AdReadForSwap {
  *     object_story_spec and modern asset_feed_spec creatives).
  *  2. POST /act_X/adcreatives with the same image/text spec but new
  *     lead_gen_form_id inside the SIGN_UP CTA.
- *  3. POST /{ad-id} with creative_id=<new> to rebind.
+ *  3. Rebind the ad to <new> through rebindAdCreative's placement-rule check.
  *
  * The ad-id is unchanged. Meta may briefly re-review.
  */
@@ -500,9 +501,7 @@ export async function swapAdLeadForm(
   }
 
   const created = await graphPost<CreativeCreateResponse>(`${acct}/adcreatives`, accessToken, body);
-  await graphPost<AdUpdateResponse>(adId, accessToken, {
-    creative: JSON.stringify({ creative_id: created.id }),
-  });
+  await rebindCreatedCreative(adId, created.id, accessToken);
 
   return {
     ad_id: ad.id,
@@ -539,6 +538,9 @@ export interface RebindAdCreativeResult {
 type RebindRuleCheck =
   | { ok: true; preserved: boolean | null }
   | { ok: false; refusal: string };
+
+/** The placement-rule check refused a real rebind. The message is the refusal itself. */
+class RebindRefusedError extends Error {}
 
 /**
  * The asset_customization_rules safety check for moving `adId` from
@@ -667,12 +669,32 @@ export async function rebindAdCreative(
       ...dryRunField(check.ok ? null : check.refusal),
     };
   }
-  if (!check.ok) throw new Error(check.refusal);
+  if (!check.ok) throw new RebindRefusedError(check.refusal);
 
   await graphPost<AdUpdateResponse>(adId, accessToken, {
     creative: JSON.stringify({ creative_id: newCreativeId }),
   });
   return { ...ids, changed: true, customization_rules_preserved: check.preserved };
+}
+
+/**
+ * The rebind step of the create-then-rebind tools (url_tags update, lead-form
+ * swap, text edit). It goes through rebindAdCreative without force, so the
+ * placement-rule check runs before the ad moves. By then the new creative
+ * already exists, and these tools have no way to force the rebind, so a
+ * refusal also names the creative left behind and the tool that can attach it.
+ */
+async function rebindCreatedCreative(adId: string, createdId: string, accessToken: string): Promise<void> {
+  try {
+    await rebindAdCreative(adId, createdId, accessToken, false, false);
+  } catch (e) {
+    if (!(e instanceof RebindRefusedError)) throw e;
+    throw new Error(
+      `${e.message} Note: creative ${createdId}, created by this call, is not attached to ad ${adId}. ` +
+      `To attach it anyway, call meta_ads_rebind_ad_creative with ad_id=${adId}, ` +
+      `creative_id=${createdId} and force=true.`,
+    );
+  }
 }
 
 /* ------------------------------------------------------------------------- */
@@ -693,6 +715,11 @@ export interface EditCreativeTextResult {
   mode: 'asset_feed_spec' | 'object_story_spec';
   changed_fields: string[];
   customization_rules_preserved: number;
+  /**
+   * Dry runs only. The label-orphaning refusal the real call would throw, or
+   * null when it would go ahead. Real-call results never carry this field.
+   */
+  would_refuse?: string | null;
 }
 
 interface CreativeReadForEdit {
@@ -748,6 +775,11 @@ interface AdReadForEdit {
  * (single primary text), link_data.name (single headline), link_data.description.
  * The messages/headlines/descriptions arrays must each have length ≤ 1 in that
  * mode.
+ *
+ * `dryRun=true` makes the same reads and runs the same label check, then returns
+ * without writing: `would_refuse` is the message the real call would throw, or
+ * null when it would go ahead. The rebind's placement-rule check needs the new
+ * creative, which only the real call creates, so a dry run can't preview it.
  */
 export async function editCreativeText(
   adId: string,
@@ -806,6 +838,9 @@ export async function editCreativeText(
   if (creative.instagram_user_id) body.instagram_user_id = creative.instagram_user_id;
 
   let rulesCount = 0;
+  // The label check's refusal, if any. A real run throws it at once; a dry run reports it.
+  let refusal: string | null = null;
+  const dryRunField = () => (dryRun ? { would_refuse: refusal } : {});
 
   if (isAssetFeed) {
     const afs = creative.asset_feed_spec!;
@@ -818,27 +853,23 @@ export async function editCreativeText(
     const refsDesc = rulesRefs.includes('"description_label"');
     if (!force) {
       if (edits.messages && refsBody && edits.messages.length !== (afs.bodies?.length ?? 0)) {
-        throw new Error(
+        refusal =
           `Refusing to edit messages on ad ${adId}: asset_customization_rules reference body_label ` +
           `and new length (${edits.messages.length}) differs from existing (${afs.bodies?.length ?? 0}). ` +
-          `Replacing would orphan label references. Pass force=true to override.`,
-        );
-      }
-      if (edits.headlines && refsTitle && edits.headlines.length !== (afs.titles?.length ?? 0)) {
-        throw new Error(
+          `Replacing would orphan label references. Pass force=true to override.`;
+      } else if (edits.headlines && refsTitle && edits.headlines.length !== (afs.titles?.length ?? 0)) {
+        refusal =
           `Refusing to edit headlines on ad ${adId}: asset_customization_rules reference title_label ` +
           `and new length (${edits.headlines.length}) differs from existing (${afs.titles?.length ?? 0}). ` +
-          `Pass force=true to override.`,
-        );
-      }
-      if (edits.descriptions && refsDesc && edits.descriptions.length !== (afs.descriptions?.length ?? 0)) {
-        throw new Error(
+          `Pass force=true to override.`;
+      } else if (edits.descriptions && refsDesc && edits.descriptions.length !== (afs.descriptions?.length ?? 0)) {
+        refusal =
           `Refusing to edit descriptions on ad ${adId}: asset_customization_rules reference ` +
           `description_label and new length (${edits.descriptions.length}) differs from existing ` +
-          `(${afs.descriptions?.length ?? 0}). Pass force=true to override.`,
-        );
+          `(${afs.descriptions?.length ?? 0}). Pass force=true to override.`;
       }
     }
+    if (refusal && !dryRun) throw new Error(refusal);
 
     // Build replacement text arrays: keep adlabels[i] when present, swap text[i].
     const swapText = (
@@ -948,6 +979,7 @@ export async function editCreativeText(
       mode,
       changed_fields: [],
       customization_rules_preserved: rulesCount,
+      ...dryRunField(),
     };
   }
 
@@ -960,13 +992,14 @@ export async function editCreativeText(
       mode,
       changed_fields: changedFields,
       customization_rules_preserved: rulesCount,
+      ...dryRunField(),
     };
   }
 
   const created = await graphPost<CreativeCreateResponse>(`${acct}/adcreatives`, accessToken, body);
   // Rebind WITHOUT force — relies on our own preservation; the safety check
   // will catch any regression where we accidentally dropped customization rules.
-  await rebindAdCreative(adId, created.id, accessToken, false, false);
+  await rebindCreatedCreative(adId, created.id, accessToken);
   return {
     ad_id: ad.id,
     ad_name: ad.name,

@@ -46,7 +46,7 @@ beforeEach(() => vi.restoreAllMocks());
 afterEach(() => vi.unstubAllGlobals());
 
 const TOKEN = 'TT';
-const AD_ID = 'ad_120238848384530447';
+const AD_ID = 'ad_100000000000000001';
 const OLD_CREATIVE_ID = 'cr_old_with_rules';
 const NEW_CREATIVE_ID = 'cr_new_no_rules';
 
@@ -77,7 +77,7 @@ describe('rebindAdCreative — asset_customization_rules safety check', () => {
     await expect(
       rebindAdCreative(AD_ID, NEW_CREATIVE_ID, TOKEN, /* dryRun */ false, /* force */ false),
     ).rejects.toThrow(
-      /Refusing to rebind ad ad_120238848384530447: previous creative cr_old_with_rules has 4 asset_customization_rules.*new creative cr_new_no_rules has none/s,
+      /Refusing to rebind ad ad_100000000000000001: previous creative cr_old_with_rules has 4 asset_customization_rules.*new creative cr_new_no_rules has none/s,
     );
 
     // Critical: the rebind POST must NOT have fired. Only the three GETs
@@ -137,6 +137,14 @@ function graphMock(handler: (c: GraphCall) => Reply) {
 const posts = (calls: GraphCall[]) => calls.filter((c) => c.method === 'POST');
 const json = (s: string | undefined) => JSON.parse(s ?? 'null');
 
+/** The fields rebindAdCreative's placement-rule check reads on each creative. */
+const RULE_READ = 'asset_feed_spec{asset_customization_rules}';
+const ruleReads = (calls: GraphCall[]) =>
+  calls.filter((c) => c.method === 'GET' && c.query.fields === RULE_READ).map((c) => c.path).sort();
+/** A rule read's reply: the rules, or the GraphFail a failed read returns. */
+const ruleReply = (id: string, r: unknown[] | GraphFail) =>
+  r instanceof GraphFail ? r : { id, asset_feed_spec: { asset_customization_rules: r } };
+
 beforeEach(() => {
   vi.stubGlobal(
     'fetch',
@@ -192,11 +200,20 @@ interface UrlTagsWorld {
   learningTs?: number;
   learningTsAfterRebind?: number;
   failLearning?: boolean;
+  /** The current creative's placement rules as the rule check reads them; a GraphFail is a failed read. Default: none. */
+  oldRules?: unknown[] | GraphFail;
+  /** The rebind POST fails with this Graph error. */
+  rebindError?: GraphFail;
 }
 
 function urlTagsMock(world: UrlTagsWorld) {
   let rebound = false;
   const calls = graphMock((c) => {
+    if (c.method === 'GET' && c.query.fields === RULE_READ) {
+      if (c.path === world.creativeId) return ruleReply(c.path, world.oldRules ?? []);
+      // The new creative is built from the Page post and url_tags alone, so it has no asset_feed_spec.
+      if (c.path === 'cr_new') return { id: 'cr_new' };
+    }
     if (c.method === 'GET' && c.path === 'ad_1') {
       return {
         id: 'ad_1',
@@ -223,6 +240,7 @@ function urlTagsMock(world: UrlTagsWorld) {
     }
     if (c.method === 'POST' && c.path.endsWith('/adcreatives')) return { id: 'cr_new' };
     if (c.method === 'POST' && c.path === 'ad_1') {
+      if (world.rebindError) return world.rebindError;
       rebound = true;
       return { success: true };
     }
@@ -337,6 +355,53 @@ describe('updateAdUrlTags', () => {
       changed: true,
       significant_edit_triggered: false,
     });
+    // The rebind went through the placement-rule check: both creatives' rules
+    // were read, and only then was the ad rebound.
+    expect(ruleReads(calls)).toEqual(['cr_new', 'cr_old']);
+    const lastRuleRead = Math.max(...calls.flatMap((c, i) => (c.query.fields === RULE_READ ? [i] : [])));
+    expect(calls.indexOf(rebind!)).toBeGreaterThan(lastRuleRead);
+  });
+
+  it('refuses to rebind when the new creative would drop the ad’s placement rules, and leaves the ad on its creative', async () => {
+    const calls = urlTagsMock({ ...base, oldRules: RULES });
+
+    const err = await updateAdUrlTags('ad_1', 'utm_source=new', TOKEN, false).then(
+      () => null,
+      (e: unknown) => e as Error,
+    );
+
+    expect(err?.message).toMatch(
+      /^Refusing to rebind ad ad_1: previous creative cr_old has 2 asset_customization_rules.*new creative cr_new has none/s,
+    );
+    // The creative was created, but the ad was never rebound to it.
+    expect(posts(calls).map((c) => c.path)).toEqual(['act_111/adcreatives']);
+    // This tool has no force option, so the refusal names the creative it left behind and the tool that can attach it.
+    expect(err?.message).toMatch(/creative cr_new, created by this call, is not attached to ad ad_1/);
+    expect(err?.message).toMatch(/meta_ads_rebind_ad_creative with ad_id=ad_1, creative_id=cr_new and force=true/);
+  });
+
+  it('refuses to rebind when the current creative’s placement rules cannot be read', async () => {
+    const calls = urlTagsMock({
+      ...base,
+      oldRules: new GraphFail('Application does not have permission for this action', 10),
+    });
+
+    await expect(updateAdUrlTags('ad_1', 'utm_source=new', TOKEN, false)).rejects.toThrow(
+      /^Refusing to rebind ad ad_1: could not read the placement rules.*does not have permission/s,
+    );
+    expect(posts(calls).filter((c) => c.path === 'ad_1')).toEqual([]);
+  });
+
+  it('a Graph error on the rebind POST passes through as is, without the refusal note', async () => {
+    urlTagsMock({ ...base, rebindError: new GraphFail('Ad is under review', 2) });
+
+    const err = await updateAdUrlTags('ad_1', 'utm_source=new', TOKEN, false).then(
+      () => null,
+      (e: unknown) => e as Error,
+    );
+
+    expect(err?.message).toMatch(/^Meta Graph POST ad_1 failed: Ad is under review/);
+    expect(err?.message).not.toMatch(/created by this call/);
   });
 
   it('uses effective_object_story_id when object_story_id is absent', async () => {
@@ -412,10 +477,28 @@ function legacyCreative(overrides: Record<string, unknown> = {}) {
   };
 }
 
-function swapMock(creative: unknown, accountId = '111') {
+/**
+ * The rule check's reads: by default the current creative's rules are the ones
+ * on `creative`, and the new creative's are whatever the create POST carried.
+ * `oldRules` / `newRules` override them (a GraphFail is a failed read).
+ */
+function swapMock(
+  creative: unknown,
+  accountId = '111',
+  reads: { oldRules?: unknown[] | GraphFail; newRules?: unknown[] } = {},
+) {
+  let createdSpec: { asset_customization_rules?: unknown[] } | null = null;
   return graphMock((c) => {
+    if (c.method === 'GET' && c.query.fields === RULE_READ) {
+      const stored = (creative as { asset_feed_spec?: { asset_customization_rules?: unknown[] } }).asset_feed_spec;
+      if (c.path === 'cr_old') return ruleReply(c.path, reads.oldRules ?? stored?.asset_customization_rules ?? []);
+      if (c.path === 'cr_new') return ruleReply(c.path, reads.newRules ?? createdSpec?.asset_customization_rules ?? []);
+    }
     if (c.method === 'GET' && c.path === 'ad_1') return { id: 'ad_1', name: 'Lead ad', account_id: accountId, creative };
-    if (c.method === 'POST' && c.path.endsWith('/adcreatives')) return { id: 'cr_new' };
+    if (c.method === 'POST' && c.path.endsWith('/adcreatives')) {
+      createdSpec = json(c.form.asset_feed_spec);
+      return { id: 'cr_new' };
+    }
     if (c.method === 'POST' && c.path === 'ad_1') return { success: true };
     return new GraphFail(`unrouted ${c.method} ${c.path}`);
   });
@@ -464,6 +547,34 @@ describe('swapAdLeadForm', () => {
     expect(rebind?.path).toBe('ad_1');
     expect(json(rebind?.form.creative)).toEqual({ creative_id: 'cr_new' });
     expect(r).toMatchObject({ previous_creative_id: 'cr_old', new_creative_id: 'cr_new', changed: true });
+    // The rebind went through the placement-rule check before the rebind POST.
+    expect(ruleReads(calls)).toEqual(['cr_new', 'cr_old']);
+    const lastRuleRead = Math.max(...calls.flatMap((c, i) => (c.query.fields === RULE_READ ? [i] : [])));
+    expect(calls.indexOf(rebind!)).toBeGreaterThan(lastRuleRead);
+  });
+
+  it('asset-feed: refuses to rebind when the new creative comes back without the placement rules', async () => {
+    const calls = swapMock(assetFeedCreative(), '111', { newRules: [] });
+
+    const err = await swapAdLeadForm('ad_1', 'form_new', TOKEN, false).then(
+      () => null,
+      (e: unknown) => e as Error,
+    );
+
+    expect(err?.message).toMatch(
+      /^Refusing to rebind ad ad_1: previous creative cr_old has 2 asset_customization_rules.*new creative cr_new has none/s,
+    );
+    expect(err?.message).toMatch(/creative cr_new, created by this call, is not attached to ad ad_1/);
+    expect(posts(calls).map((c) => c.path)).toEqual(['act_111/adcreatives']);
+  });
+
+  it('refuses to rebind when the current creative’s placement rules cannot be read', async () => {
+    const calls = swapMock(legacyCreative(), '111', { oldRules: new GraphFail('User request limit reached', 17) });
+
+    await expect(swapAdLeadForm('ad_1', 'form_new', TOKEN, false)).rejects.toThrow(
+      /^Refusing to rebind ad ad_1: could not read the placement rules.*User request limit reached/s,
+    );
+    expect(posts(calls).filter((c) => c.path === 'ad_1')).toEqual([]);
   });
 
   it('legacy creative: rebuilds link_data with the new form and adds the act_ prefix', async () => {
@@ -485,6 +596,8 @@ describe('swapAdLeadForm', () => {
       },
     });
     expect(r.mode).toBe('object_story_spec');
+    // No placement rules on a legacy creative, so the rule check lets the rebind through.
+    expect(posts(calls).map((c) => c.path)).toEqual(['act_111/adcreatives', 'ad_1']);
   });
 
   it('uses the CTA type override instead of the existing type', async () => {
@@ -684,6 +797,22 @@ describe('editCreativeText', () => {
     expect(ruleReads.map((c) => c.path).sort()).toEqual(['cr_new', 'cr_old']);
     const rebinds = posts(calls).filter((c) => c.path === 'ad_1');
     expect(rebinds.map((c) => json(c.form.creative))).toEqual([{ creative_id: 'cr_new' }]);
+    expect(r).not.toHaveProperty('would_refuse'); // real runs never carry it
+  });
+
+  it('asset-feed: a refused rebind names the creative it created and how to attach it', async () => {
+    // Meta returns the new creative without the rules the edit carried.
+    const calls = editMock({ creative: dcoCreative(), newCreativeRules: [] });
+
+    const err = await editCreativeText('ad_1', { headlines: ['New A', 'New B'] }, TOKEN, false).then(
+      () => null,
+      (e: unknown) => e as Error,
+    );
+
+    expect(err?.message).toMatch(/^Refusing to rebind ad ad_1: previous creative cr_old has 2 asset_customization_rules/);
+    expect(err?.message).toMatch(/creative cr_new, created by this call, is not attached to ad ad_1/);
+    expect(err?.message).toMatch(/meta_ads_rebind_ad_creative with ad_id=ad_1, creative_id=cr_new and force=true/);
+    expect(posts(calls).map((c) => c.path)).toEqual(['act_111/adcreatives']);
   });
 
   it('asset-feed: carries on without call_to_actions when Meta denies that read', async () => {
@@ -715,13 +844,70 @@ describe('editCreativeText', () => {
     expect(json(posts(calls)[0]?.form.asset_feed_spec).bodies).toEqual([{ text: 'Only one' }]);
   });
 
-  it('dry run lists the changed fields and sends no POST', async () => {
+  it('dry run lists the changed fields, reports no refusal and sends no POST', async () => {
     const calls = editMock({ creative: dcoCreative() });
 
     const r = await editCreativeText('ad_1', { headlines: ['A', 'B'] }, TOKEN, true);
 
     expect(posts(calls)).toEqual([]);
-    expect(r).toMatchObject({ changed_fields: ['headlines'], new_creative_id: '' });
+    expect(r).toMatchObject({ changed_fields: ['headlines'], new_creative_id: '', would_refuse: null });
+  });
+
+  /**
+   * Like meta_ads_rebind_ad_creative's dry run (incrementality#25), a dry run
+   * that the real run would refuse returns a result carrying the refusal
+   * instead of throwing it. One case per label the rules can reference.
+   */
+  const labelRefusals: Array<[string, Record<string, unknown>, Record<string, string[]>, RegExp]> = [
+    ['messages / body_label', { body_label: { name: 'b1' } }, { messages: ['Only one'] }, /^Refusing to edit messages on ad ad_1: .*body_label/s],
+    ['headlines / title_label', { title_label: { name: 't1' } }, { headlines: ['A', 'B', 'C'] }, /^Refusing to edit headlines on ad ad_1: .*title_label/s],
+    ['descriptions / description_label', { description_label: { name: 'd1' } }, { descriptions: ['A', 'B'] }, /^Refusing to edit descriptions on ad ad_1: .*description_label/s],
+  ];
+
+  it.each(labelRefusals)(
+    'dry run returns the %s refusal as would_refuse, the exact message the real run throws, and sends no POST',
+    async (_label, labelRef, edits, refusal) => {
+      const labelRules = [{ customization_spec: { publisher_platforms: ['facebook'] }, ...labelRef }];
+      editMock({ creative: dcoCreative(labelRules) });
+      const real = await editCreativeText('ad_1', edits, TOKEN, false).then(
+        () => null,
+        (e: unknown) => e as Error,
+      );
+      expect(real?.message).toMatch(refusal);
+
+      const calls = editMock({ creative: dcoCreative(labelRules) });
+      const r = await editCreativeText('ad_1', edits, TOKEN, true);
+
+      expect(r).toEqual({
+        ad_id: 'ad_1',
+        ad_name: 'Ad',
+        previous_creative_id: 'cr_old',
+        new_creative_id: '',
+        mode: 'asset_feed_spec',
+        changed_fields: Object.keys(edits),
+        customization_rules_preserved: 1,
+        would_refuse: real!.message,
+      });
+      expect(posts(calls)).toEqual([]);
+    },
+  );
+
+  it('dry run with force=true reports no refusal, like the real run', async () => {
+    const labelRules = [{ customization_spec: { publisher_platforms: ['facebook'] }, body_label: { name: 'b1' } }];
+    const calls = editMock({ creative: dcoCreative(labelRules) });
+
+    const r = await editCreativeText('ad_1', { messages: ['Only one'] }, TOKEN, true, true);
+
+    expect(r).toMatchObject({ changed_fields: ['messages'], new_creative_id: '', would_refuse: null });
+    expect(posts(calls)).toEqual([]);
+  });
+
+  it('dry run of an edit that changes nothing reports no refusal', async () => {
+    editMock({ creative: legacyCreative() });
+
+    const r = await editCreativeText('ad_1', { headlines: [] }, TOKEN, true);
+
+    expect(r).toMatchObject({ changed_fields: [], new_creative_id: 'cr_old', would_refuse: null });
   });
 
   it('legacy: replaces the headline and keeps link, message, image and CTA', async () => {
@@ -751,6 +937,7 @@ describe('editCreativeText', () => {
 
     expect(posts(calls)).toEqual([]);
     expect(r).toMatchObject({ changed_fields: [], new_creative_id: 'cr_old' });
+    expect(r).not.toHaveProperty('would_refuse');
   });
 });
 

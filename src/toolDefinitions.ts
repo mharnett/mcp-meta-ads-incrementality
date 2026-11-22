@@ -99,8 +99,11 @@ const TOOL_UPDATE_AD_URL_TAGS = {
     'string fragment WITHOUT a leading ?, e.g. "utm_source=facebook&utm_campaign=foo&' +
     'campaignid={{campaign.id}}". Note Meta uses double-brace macros ({{campaign.id}}, ' +
     '{{ad.id}}, {{ad.name}}, etc.), not Google-Ads-style single braces. ' +
-    'Mechanism: POSTs a creative override to the ad, which forks a new creative under the ' +
-    'hood while keeping the ad_id stable. Pass dry_run=true to preview without writing. ' +
+    'Mechanism: creates a new creative on the same Page post with the new url_tags, then ' +
+    'rebinds the ad to it, keeping the ad_id stable. SAFETY: the rebind runs the same ' +
+    'placement-rule check as meta_ads_rebind_ad_creative and refuses when the ad\'s ' +
+    'per-placement image rules (asset_customization_rules) would be dropped or can\'t be read; ' +
+    'dry_run does not run that check. Pass dry_run=true to preview without writing. ' +
     'Recommend testing on a PAUSED ad before touching active ones — Meta may briefly re-review.',
   inputSchema: {
     type: 'object',
@@ -556,8 +559,11 @@ const TOOL_SWAP_AD_LEAD_FORM = {
     'Swap the lead form on an existing Meta ad by rebuilding its creative with a new ' +
     'lead_gen_form_id, then rebinding the ad. Ad_id stays stable. Handles both legacy ' +
     'object_story_spec creatives and modern asset_feed_spec (Flexible Ads) creatives — ' +
-    'preserves all image/text content, only the SIGN_UP CTA form_id changes. Pass dry_run=true ' +
-    'to preview. Meta may briefly re-review the ad after the swap.',
+    'preserves all image/text content, only the SIGN_UP CTA form_id changes. SAFETY: the rebind ' +
+    'runs the same placement-rule check as meta_ads_rebind_ad_creative and refuses when the ' +
+    'ad\'s per-placement image rules (asset_customization_rules) would be dropped or can\'t be ' +
+    'read; dry_run does not run that check. Pass dry_run=true to preview. Meta may briefly ' +
+    're-review the ad after the swap.',
   inputSchema: {
     type: 'object',
     properties: {
@@ -638,7 +644,12 @@ const TOOL_EDIT_CREATIVE_TEXT = {
         items: { type: 'string' },
         description: 'Up to 5 description variants. Replaces the entire descriptions[] array.',
       },
-      dry_run: { type: 'boolean', description: 'If true, return a diff without writing.' },
+      dry_run: {
+        type: 'boolean',
+        description:
+          'If true, run the label-orphaning check and return the diff without writing: ' +
+          'would_refuse is the refusal the real call would give, or null if it would go ahead.',
+      },
       force: {
         type: 'boolean',
         description: 'Bypass the label-orphaning safety check (only for DCO-style ads with labeled text).',

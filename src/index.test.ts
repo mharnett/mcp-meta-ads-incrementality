@@ -357,3 +357,67 @@ describe('meta_ads_rebind_ad_creative dry_run at the call site (writes enabled)'
     }
   });
 });
+
+describe('meta_ads_edit_creative_text dry_run at the call site (writes enabled)', () => {
+  const OLD_CREATIVE = '120000000000042';
+
+  it('returns the label-orphaning refusal the real call would throw, as a result rather than an error, and writes nothing', async () => {
+    vi.stubEnv('META_ADS_MCP_WRITE', 'true');
+    // A two-body asset-feed ad whose placement rule references a body label; the edit drops to one body.
+    const restore = fetchMock.getMockImplementation()!;
+    fetchMock.mockImplementation(async (input: string | URL | Request, init?: RequestInit) => {
+      const u = new URL(String(input));
+      fetchCalls.push({ url: u.toString(), method: init?.method ?? 'GET', body: new URLSearchParams(init?.body ? String(init.body) : '') });
+      const id = u.pathname.split('/').pop();
+      const body =
+        id === AD
+          ? {
+              id: AD,
+              name: 'Call-site ad',
+              account_id: ACCOUNT.replace(/^act_/, ''),
+              creative: {
+                id: OLD_CREATIVE,
+                object_story_spec: { page_id: PAGE },
+                asset_feed_spec: {
+                  bodies: [{ text: 'Body A' }, { text: 'Body B' }],
+                  asset_customization_rules: [
+                    { customization_spec: { publisher_platforms: ['facebook'] }, body_label: { name: 'b1' } },
+                  ],
+                },
+              },
+            }
+          : { id };
+      return new Response(JSON.stringify(body), { status: 200, headers: { 'content-type': 'application/json' } });
+    });
+    try {
+      const dry = await client.callTool({
+        name: 'meta_ads_edit_creative_text',
+        arguments: { ad_id: AD, messages: ['Only one'], dry_run: true },
+      });
+      const real = await client.callTool({
+        name: 'meta_ads_edit_creative_text',
+        arguments: { ad_id: AD, messages: ['Only one'] },
+      });
+
+      expect(dry.isError ?? false).toBe(false);
+      const out = JSON.parse(textOf(dry));
+      expect(Object.keys(out).sort()).toEqual([
+        'ad_id',
+        'ad_name',
+        'changed_fields',
+        'customization_rules_preserved',
+        'mode',
+        'new_creative_id',
+        'previous_creative_id',
+        'would_refuse',
+      ]);
+      expect(out).toMatchObject({ ad_id: AD, previous_creative_id: OLD_CREATIVE, new_creative_id: '', changed_fields: ['messages'] });
+      expect(out.would_refuse).toMatch(/^Refusing to edit messages on ad /);
+      expect(real.isError).toBe(true);
+      expect(textOf(real)).toContain(out.would_refuse);
+      expect(fetchCalls.filter((c) => c.method === 'POST')).toEqual([]);
+    } finally {
+      fetchMock.mockImplementation(restore);
+    }
+  });
+});
