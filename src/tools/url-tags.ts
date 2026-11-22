@@ -174,6 +174,11 @@ export interface UpdateAdUrlTagsResult {
   learning_before: LearningStageInfo | null;
   learning_after: LearningStageInfo | null;
   significant_edit_triggered: boolean | null;
+  /**
+   * Dry runs only. The placement-rule refusal the real call would throw, or
+   * null when that check passes. Real-call results never carry this field.
+   */
+  would_refuse?: string | null;
 }
 
 interface AdUpdateResponse {
@@ -205,6 +210,10 @@ interface CreativeCreateResponse {
  *      per-placement image rules don't carry over is refused, not flattened.
  *   4. Re-read learning_stage_info; compare last_significant_edit_ts.
  *
+ * Before step 2, checkRulesBeforeCreate runs the placement-rule check against
+ * what the new creative will carry (no rules), so a refusal creates nothing.
+ * `dryRun=true` runs that check too and returns its refusal as `would_refuse`.
+ *
  * If last_significant_edit_ts is unchanged, Meta did not consider the edit
  * significant — confirming learning is preserved. If it advanced to roughly
  * the time of our write, Meta did trigger a relearning event and the writer
@@ -217,8 +226,12 @@ export async function updateAdUrlTags(
   dryRun: boolean,
 ): Promise<UpdateAdUrlTagsResult> {
   const before = await getAdUrlTags(adId, accessToken);
+  // The new creative is built from the Page post and url_tags alone, so it
+  // carries no asset_customization_rules.
+  const carriedRules: unknown[] = [];
 
   if (dryRun) {
+    const changed = before.url_tags !== newUrlTags;
     return {
       ad_id: before.ad_id,
       ad_name: before.ad_name,
@@ -226,10 +239,13 @@ export async function updateAdUrlTags(
       new_url_tags: newUrlTags,
       previous_creative_id: before.creative_id,
       new_creative_id: '',
-      changed: before.url_tags !== newUrlTags,
+      changed,
       learning_before: before.learning_stage_info,
       learning_after: null,
       significant_edit_triggered: null,
+      would_refuse: changed
+        ? await checkRulesBeforeCreate(adId, before.creative_id, carriedRules, accessToken)
+        : null,
     };
   }
 
@@ -257,6 +273,9 @@ export async function updateAdUrlTags(
   if (!before.account_id) {
     throw new Error(`Ad ${adId} did not return account_id.`);
   }
+
+  const refusal = await checkRulesBeforeCreate(adId, before.creative_id, carriedRules, accessToken);
+  if (refusal) throw new Error(refusal);
 
   const created = await graphPost<CreativeCreateResponse>(
     `act_${before.account_id}/adcreatives`,
@@ -303,6 +322,11 @@ export interface SwapAdLeadFormResult {
   new_form_id: string;
   mode: 'asset_feed_spec' | 'object_story_spec';
   changed: boolean;
+  /**
+   * Dry runs only. The placement-rule refusal the real call would throw, or
+   * null when that check passes. Real-call results never carry this field.
+   */
+  would_refuse?: string | null;
 }
 
 interface CreativeReadFull {
@@ -388,6 +412,10 @@ interface AdReadForSwap {
  *     lead_gen_form_id inside the SIGN_UP CTA.
  *  3. Rebind the ad to <new> through rebindAdCreative's placement-rule check.
  *
+ * Before step 2, checkRulesBeforeCreate runs the placement-rule check against
+ * the rules the rebuilt creative will carry, so a refusal creates nothing.
+ * `dryRun=true` runs that check too and returns its refusal as `would_refuse`.
+ *
  * The ad-id is unchanged. Meta may briefly re-review.
  */
 export async function swapAdLeadForm(
@@ -422,8 +450,12 @@ export async function swapAdLeadForm(
 
   const isAssetFeed = !!creative.asset_feed_spec && (creative.asset_feed_spec.bodies?.length ?? 0) > 0;
   const mode: 'asset_feed_spec' | 'object_story_spec' = isAssetFeed ? 'asset_feed_spec' : 'object_story_spec';
+  // The placement rules the rebuilt creative will carry: an asset-feed rebuild
+  // copies them over; a legacy link_data rebuild has nowhere to put them.
+  const carriedRules: unknown[] = isAssetFeed ? creative.asset_feed_spec?.asset_customization_rules ?? [] : [];
 
   if (dryRun) {
+    const changed = previousFormId !== newFormId;
     return {
       ad_id: ad.id,
       ad_name: ad.name,
@@ -432,7 +464,8 @@ export async function swapAdLeadForm(
       previous_form_id: previousFormId,
       new_form_id: newFormId,
       mode,
-      changed: previousFormId !== newFormId,
+      changed,
+      would_refuse: changed ? await checkRulesBeforeCreate(adId, creative.id, carriedRules, accessToken) : null,
     };
   }
 
@@ -468,9 +501,7 @@ export async function swapAdLeadForm(
     };
     if (afs.titles?.length) rebuilt.titles = afs.titles;
     if (afs.descriptions?.length) rebuilt.descriptions = afs.descriptions;
-    if (afs.asset_customization_rules?.length) {
-      rebuilt.asset_customization_rules = afs.asset_customization_rules;
-    }
+    if (carriedRules.length) rebuilt.asset_customization_rules = carriedRules;
 
     const oss = creative.object_story_spec;
     const ossOut: Record<string, unknown> = { page_id: oss?.page_id };
@@ -499,6 +530,9 @@ export async function swapAdLeadForm(
     if (oss.instagram_actor_id) ossOut.instagram_actor_id = oss.instagram_actor_id;
     body.object_story_spec = JSON.stringify(ossOut);
   }
+
+  const refusal = await checkRulesBeforeCreate(adId, creative.id, carriedRules, accessToken);
+  if (refusal) throw new Error(refusal);
 
   const created = await graphPost<CreativeCreateResponse>(`${acct}/adcreatives`, accessToken, body);
   await rebindCreatedCreative(adId, created.id, accessToken);
@@ -678,11 +712,65 @@ export async function rebindAdCreative(
 }
 
 /**
+ * The placement-rule check for the url_tags update and the lead-form swap, run
+ * BEFORE they create the new creative, so a refusal leaves no unattached
+ * creative behind. `carriedRules` is the asset_customization_rules the new
+ * creative will be created with. Reads only. Returns the refusal, or null when
+ * the check passes; the real call throws the refusal and a dry run reports it.
+ *
+ * It asks what checkRebindRules will ask once the creative exists: can the
+ * current creative's rules be read, and if it has any, will the new creative
+ * carry some. A failed read is never taken to mean "no rules". Meta can still
+ * return the new creative without rules it was sent, so the rebind runs the full
+ * check again after the create (rebindCreatedCreative).
+ */
+async function checkRulesBeforeCreate(
+  adId: string,
+  previousId: string,
+  carriedRules: unknown[],
+  accessToken: string,
+): Promise<string | null> {
+  const nothingCreated =
+    `Nothing was created or changed. This tool has no force option: to make the change anyway, ` +
+    `make it in Ads Manager, or build the new creative with meta_ads_create_ad_creative and ` +
+    `attach it with meta_ads_rebind_ad_creative.`;
+  if (!previousId) {
+    return (
+      `Refusing to rebind ad ${adId}: the ad read returned no current creative, so there is no ` +
+      `way to check whether this change would drop per-placement image rules ` +
+      `(asset_customization_rules). ${nothingCreated}`
+    );
+  }
+  const oldRead = await fetchCustomizationRules(previousId, accessToken);
+  if (!oldRead.ok) {
+    return (
+      `Refusing to rebind ad ${adId}: could not read the placement rules ` +
+      `(asset_customization_rules) on its current creative ${previousId}, so there is no way to ` +
+      `tell whether this change would drop them. Read error: ${oldRead.error}. Retry, since the ` +
+      `error may be transient; if it keeps failing, check in Ads Manager whether the ad's images ` +
+      `are customized by placement. ${nothingCreated}`
+    );
+  }
+  if (oldRead.rules.length > 0 && carriedRules.length === 0) {
+    return (
+      `Refusing to rebind ad ${adId}: current creative ${previousId} has ${oldRead.rules.length} ` +
+      `asset_customization_rules (per-placement image rules set in Ads Manager UI), and the new ` +
+      `creative this call would create carries none. Rebinding would silently drop custom ` +
+      `placements by image. ${nothingCreated}`
+    );
+  }
+  return null;
+}
+
+/**
  * The rebind step of the create-then-rebind tools (url_tags update, lead-form
  * swap, text edit). It goes through rebindAdCreative without force, so the
  * placement-rule check runs before the ad moves. By then the new creative
  * already exists, and these tools have no way to force the rebind, so a
  * refusal also names the creative left behind and the tool that can attach it.
+ * The url_tags update and the lead-form swap run checkRulesBeforeCreate first,
+ * so for them this refusal only fires when the second check disagrees with the
+ * first (a read that fails after the create, or Meta dropping the rules).
  */
 async function rebindCreatedCreative(adId: string, createdId: string, accessToken: string): Promise<void> {
   try {
