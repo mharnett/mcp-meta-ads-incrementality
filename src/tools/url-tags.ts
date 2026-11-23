@@ -205,13 +205,17 @@ interface CreativeCreateResponse {
  *   2. POST /act_X/adcreatives with {object_story_id, url_tags,
  *      object_story_spec.use_page_actor_override flag implicit} — same
  *      Page-post reference, only url_tags differs.
- *   3. Rebind the ad to <new> through rebindAdCreative's placement-rule check.
- *      The new creative is built from the Page post alone, so an ad whose
- *      per-placement image rules don't carry over is refused, not flattened.
+ *   3. Rebind the ad to <new> through rebindAdCreative's placement-rule check,
+ *      which reads the new creative's rules back. An ad whose per-placement
+ *      image rules don't carry over is refused, not flattened.
  *   4. Re-read learning_stage_info; compare last_significant_edit_ts.
  *
- * Before step 2, checkRulesBeforeCreate runs the placement-rule check against
- * what the new creative will carry (no rules), so a refusal creates nothing.
+ * Before step 2, checkRulesBeforeCreate runs the placement-rule check, so a
+ * refusal creates nothing. This call sends no rules of its own, and whether
+ * Meta copies the current creative's rules onto a creative built from the Page
+ * post has not been checked, so the pre-create check treats them as unverified:
+ * an ad whose current creative has rules is refused up front, and the refusal
+ * says the carry-over is unconfirmed rather than that the rules are dropped.
  * `dryRun=true` runs that check too and returns its refusal as `would_refuse`.
  *
  * If last_significant_edit_ts is unchanged, Meta did not consider the edit
@@ -226,9 +230,10 @@ export async function updateAdUrlTags(
   dryRun: boolean,
 ): Promise<UpdateAdUrlTagsResult> {
   const before = await getAdUrlTags(adId, accessToken);
-  // The new creative is built from the Page post and url_tags alone, so it
-  // carries no asset_customization_rules.
-  const carriedRules: unknown[] = [];
+  // The new creative is built from the Page post and url_tags alone. This call
+  // sends no asset_customization_rules; whether Meta attaches any is unknown
+  // until the creative exists.
+  const carried: CarriedRules = { unverified: PAGE_POST_CREATIVE_RULES };
 
   if (dryRun) {
     const changed = before.url_tags !== newUrlTags;
@@ -244,7 +249,7 @@ export async function updateAdUrlTags(
       learning_after: null,
       significant_edit_triggered: null,
       would_refuse: changed
-        ? await checkRulesBeforeCreate(adId, before.creative_id, carriedRules, accessToken)
+        ? await checkRulesBeforeCreate(adId, before.creative_id, carried, accessToken)
         : null,
     };
   }
@@ -274,7 +279,7 @@ export async function updateAdUrlTags(
     throw new Error(`Ad ${adId} did not return account_id.`);
   }
 
-  const refusal = await checkRulesBeforeCreate(adId, before.creative_id, carriedRules, accessToken);
+  const refusal = await checkRulesBeforeCreate(adId, before.creative_id, carried, accessToken);
   if (refusal) throw new Error(refusal);
 
   const created = await graphPost<CreativeCreateResponse>(
@@ -453,6 +458,7 @@ export async function swapAdLeadForm(
   // The placement rules the rebuilt creative will carry: an asset-feed rebuild
   // copies them over; a legacy link_data rebuild has nowhere to put them.
   const carriedRules: unknown[] = isAssetFeed ? creative.asset_feed_spec?.asset_customization_rules ?? [] : [];
+  const carried: CarriedRules = { rules: carriedRules };
 
   if (dryRun) {
     const changed = previousFormId !== newFormId;
@@ -465,7 +471,7 @@ export async function swapAdLeadForm(
       new_form_id: newFormId,
       mode,
       changed,
-      would_refuse: changed ? await checkRulesBeforeCreate(adId, creative.id, carriedRules, accessToken) : null,
+      would_refuse: changed ? await checkRulesBeforeCreate(adId, creative.id, carried, accessToken) : null,
     };
   }
 
@@ -531,7 +537,7 @@ export async function swapAdLeadForm(
     body.object_story_spec = JSON.stringify(ossOut);
   }
 
-  const refusal = await checkRulesBeforeCreate(adId, creative.id, carriedRules, accessToken);
+  const refusal = await checkRulesBeforeCreate(adId, creative.id, carried, accessToken);
   if (refusal) throw new Error(refusal);
 
   const created = await graphPost<CreativeCreateResponse>(`${acct}/adcreatives`, accessToken, body);
@@ -712,26 +718,46 @@ export async function rebindAdCreative(
 }
 
 /**
- * The placement-rule check for the url_tags update and the lead-form swap, run
- * BEFORE they create the new creative, so a refusal leaves no unattached
- * creative behind. `carriedRules` is the asset_customization_rules the new
- * creative will be created with. Reads only. Returns the refusal, or null when
- * the check passes; the real call throws the refusal and a dry run reports it.
+ * The placement rules a create-then-rebind tool's new creative will carry:
+ * `rules`, the asset_customization_rules the tool sends itself, or `unverified`
+ * when the tool sends none and what Meta attaches can't be known until the
+ * creative exists (the text says why, and goes into the refusal).
+ */
+type CarriedRules = { rules: unknown[] } | { unverified: string };
+
+/** Why a url_tags creative's rules are unverified. Finishes "The new creative this call would create is …". */
+const PAGE_POST_CREATIVE_RULES =
+  `built from the ad's Page post and url_tags alone, and whether Meta copies placement rules ` +
+  `onto such a creative is unverified`;
+
+/** What force=true covers, for a create-then-rebind tool that has none. */
+const NO_FORCE_OPTION = 'This tool has no force option';
+
+/**
+ * The placement-rule check for the url_tags update, the lead-form swap and the
+ * text edit, run BEFORE they create the new creative, so a refusal leaves no
+ * unattached creative behind. `carried` is what the new creative will carry
+ * (see CarriedRules). Reads only. Returns the refusal, or null when the check
+ * passes; the real call throws the refusal and a dry run reports it.
+ * `forceScope` says what the tool's force option covers, since none of them
+ * can force past this check.
  *
  * It asks what checkRebindRules will ask once the creative exists: can the
  * current creative's rules be read, and if it has any, will the new creative
- * carry some. A failed read is never taken to mean "no rules". Meta can still
- * return the new creative without rules it was sent, so the rebind runs the full
- * check again after the create (rebindCreatedCreative).
+ * carry some. A failed read is never taken to mean "no rules", and rules the
+ * tool doesn't send are never taken to be carried. Meta can still return the
+ * new creative without rules it was sent, so the rebind runs the full check
+ * again after the create (rebindCreatedCreative).
  */
 async function checkRulesBeforeCreate(
   adId: string,
   previousId: string,
-  carriedRules: unknown[],
+  carried: CarriedRules,
   accessToken: string,
+  forceScope: string = NO_FORCE_OPTION,
 ): Promise<string | null> {
   const nothingCreated =
-    `Nothing was created or changed. This tool has no force option: to make the change anyway, ` +
+    `Nothing was created or changed. ${forceScope}: to make the change anyway, ` +
     `make it in Ads Manager, or build the new creative with meta_ads_create_ad_creative and ` +
     `attach it with meta_ads_rebind_ad_creative.`;
   if (!previousId) {
@@ -751,7 +777,17 @@ async function checkRulesBeforeCreate(
       `are customized by placement. ${nothingCreated}`
     );
   }
-  if (oldRead.rules.length > 0 && carriedRules.length === 0) {
+  if (oldRead.rules.length === 0) return null;
+  if ('unverified' in carried) {
+    return (
+      `Refusing to rebind ad ${adId}: current creative ${previousId} has ${oldRead.rules.length} ` +
+      `asset_customization_rules (per-placement image rules set in Ads Manager UI). The new ` +
+      `creative this call would create is ${carried.unverified}, so there is no way to confirm ` +
+      `before creating it that the rules would carry over. Rebinding without them would silently ` +
+      `drop custom placements by image. ${nothingCreated}`
+    );
+  }
+  if (carried.rules.length === 0) {
     return (
       `Refusing to rebind ad ${adId}: current creative ${previousId} has ${oldRead.rules.length} ` +
       `asset_customization_rules (per-placement image rules set in Ads Manager UI), and the new ` +
@@ -768,9 +804,9 @@ async function checkRulesBeforeCreate(
  * placement-rule check runs before the ad moves. By then the new creative
  * already exists, and these tools have no way to force the rebind, so a
  * refusal also names the creative left behind and the tool that can attach it.
- * The url_tags update and the lead-form swap run checkRulesBeforeCreate first,
- * so for them this refusal only fires when the second check disagrees with the
- * first (a read that fails after the create, or Meta dropping the rules).
+ * All three run checkRulesBeforeCreate first, so this refusal only fires when
+ * the second check disagrees with the first (a read that fails after the
+ * create, or Meta dropping the rules).
  */
 async function rebindCreatedCreative(adId: string, createdId: string, accessToken: string): Promise<void> {
   try {
@@ -804,11 +840,15 @@ export interface EditCreativeTextResult {
   changed_fields: string[];
   customization_rules_preserved: number;
   /**
-   * Dry runs only. The label-orphaning refusal the real call would throw, or
-   * null when it would go ahead. Real-call results never carry this field.
+   * Dry runs only. The refusal the real call would throw (label orphaning
+   * first, then the placement-rule check), or null when it would go ahead.
+   * Real-call results never carry this field.
    */
   would_refuse?: string | null;
 }
+
+/** What force=true on the text edit covers. */
+const EDIT_FORCE_SCOPE = 'force=true on this tool skips the label check only, not this one';
 
 interface CreativeReadForEdit {
   id: string;
@@ -864,10 +904,16 @@ interface AdReadForEdit {
  * The messages/headlines/descriptions arrays must each have length ≤ 1 in that
  * mode.
  *
- * `dryRun=true` makes the same reads and runs the same label check, then returns
- * without writing: `would_refuse` is the message the real call would throw, or
- * null when it would go ahead. The rebind's placement-rule check needs the new
- * creative, which only the real call creates, so a dry run can't preview it.
+ * Before it creates the new creative, checkRulesBeforeCreate runs the
+ * placement-rule check against the rules the rebuild carries (the current ones
+ * for asset_feed_spec, none for a legacy link_data rebuild), so a refusal
+ * creates nothing. force=true skips the label check only, never this one: the
+ * rebind after the create runs without force either way.
+ *
+ * `dryRun=true` makes the same reads and runs the same checks (the label check,
+ * then, if it passes, the placement-rule check), then returns without writing:
+ * `would_refuse` is the message the real call would throw, or null when it would
+ * go ahead. The rebind still runs its full check after the real create.
  */
 export async function editCreativeText(
   adId: string,
@@ -926,7 +972,12 @@ export async function editCreativeText(
   if (creative.instagram_user_id) body.instagram_user_id = creative.instagram_user_id;
 
   let rulesCount = 0;
-  // The label check's refusal, if any. A real run throws it at once; a dry run reports it.
+  // The rules the rebuilt creative will carry: the asset_feed_spec rebuild
+  // copies them; a legacy link_data rebuild has nowhere to put them.
+  const carried: CarriedRules = {
+    rules: isAssetFeed ? creative.asset_feed_spec?.asset_customization_rules ?? [] : [],
+  };
+  // The first refusal, if any. A real run throws it at once; a dry run reports it.
   let refusal: string | null = null;
   const dryRunField = () => (dryRun ? { would_refuse: refusal } : {});
 
@@ -1071,6 +1122,12 @@ export async function editCreativeText(
     };
   }
 
+  // A real run that failed the label check has already thrown; a dry run that
+  // failed it reports that refusal, which the real run would hit first.
+  if (refusal === null) {
+    refusal = await checkRulesBeforeCreate(adId, creative.id, carried, accessToken, EDIT_FORCE_SCOPE);
+  }
+
   if (dryRun) {
     return {
       ad_id: ad.id,
@@ -1083,6 +1140,7 @@ export async function editCreativeText(
       ...dryRunField(),
     };
   }
+  if (refusal) throw new Error(refusal);
 
   const created = await graphPost<CreativeCreateResponse>(`${acct}/adcreatives`, accessToken, body);
   // Rebind WITHOUT force — relies on our own preservation; the safety check
