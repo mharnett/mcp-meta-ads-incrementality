@@ -217,7 +217,7 @@ function urlTagsMock(world: UrlTagsWorld) {
         const rules = created && world.oldRulesAfterCreate !== undefined ? world.oldRulesAfterCreate : world.oldRules;
         return ruleReply(c.path, rules ?? []);
       }
-      // The new creative is built from the Page post and url_tags alone, so it has no asset_feed_spec.
+      // This fake's Page-post creative comes back with no asset_feed_spec; what Meta does is unverified.
       if (c.path === 'cr_new') return { id: 'cr_new' };
     }
     if (c.method === 'GET' && c.path === 'ad_1') {
@@ -331,9 +331,11 @@ describe('updateAdUrlTags', () => {
    */
   const urlTagsRefusals: Array<[string, Partial<UrlTagsWorld>, RegExp]> = [
     [
-      'the current creative has placement rules the new creative would not carry',
+      'the current creative has placement rules a Page-post creative is not known to carry',
       { oldRules: RULES },
-      /^Refusing to rebind ad ad_1: current creative cr_old has 2 asset_customization_rules.*the new creative this call would create carries none/s,
+      // Whether Meta copies the rules onto a creative built from the Page post
+      // is unverified, so the refusal says that, not that the creative carries none.
+      /^Refusing to rebind ad ad_1: current creative cr_old has 2 asset_customization_rules.*built from the ad's Page post and url_tags alone.*unverified/s,
     ],
     [
       'the current creative’s placement rules cannot be read',
@@ -353,6 +355,7 @@ describe('updateAdUrlTags', () => {
     expect(err?.message).toMatch(refusal);
     expect(err?.message).toMatch(/Nothing was created or changed/);
     expect(err?.message).not.toMatch(/created by this call/);
+    expect(err?.message).not.toMatch(/carries none/);
     // No create POST, so no creative is left unattached; no rebind POST either.
     expect(posts(calls)).toEqual([]);
     expect(ruleReads(calls)).toEqual(['cr_old']);
@@ -848,11 +851,19 @@ interface EditWorld {
   creative: Record<string, unknown>;
   ctas?: unknown[] | GraphFail;
   newCreativeRules?: unknown[];
+  /**
+   * What the rule check's own read of the current creative returns, when it
+   * differs from the rules on `creative` (a GraphFail is a failed read).
+   */
+  oldRules?: unknown[] | GraphFail;
 }
 
 function editMock(world: EditWorld) {
   let rebound = false;
   return graphMock((c) => {
+    if (c.method === 'GET' && c.path === 'cr_old' && c.query.fields === RULE_READ && world.oldRules !== undefined) {
+      return ruleReply('cr_old', world.oldRules);
+    }
     if (c.method === 'GET' && c.path === 'ad_1') {
       const fields = c.query.fields ?? '';
       if (fields === 'creative{asset_feed_spec{call_to_actions}}') {
@@ -942,17 +953,21 @@ describe('editCreativeText', () => {
     expect(afs.call_to_actions).toEqual([{ type: 'LEARN_MORE', value: { link: 'https://example.test/' } }]);
     expect(afs.optimization_type).toBe('PLACEMENT');
     expect(r).toMatchObject({ mode: 'asset_feed_spec', changed_fields: ['headlines'], new_creative_id: 'cr_new', customization_rules_preserved: 2 });
-    // The rebind goes through rebindAdCreative's rule check (both creatives'
-    // rules are read, so no force), then one POST.
-    const ruleReads = calls.filter((c) => c.method === 'GET' && c.query.fields === 'asset_feed_spec{asset_customization_rules}');
-    expect(ruleReads.map((c) => c.path).sort()).toEqual(['cr_new', 'cr_old']);
+    // The current creative's rules are checked before the create; the rebind
+    // then goes through rebindAdCreative's rule check (both creatives' rules
+    // are read, so no force), then one POST.
+    expect(ruleReads(calls)).toEqual(['cr_new', 'cr_old', 'cr_old']);
+    const firstRuleRead = calls.findIndex((c) => c.query.fields === RULE_READ);
+    expect(calls[firstRuleRead]?.path).toBe('cr_old');
+    expect(firstRuleRead).toBeLessThan(calls.indexOf(create!));
     const rebinds = posts(calls).filter((c) => c.path === 'ad_1');
     expect(rebinds.map((c) => json(c.form.creative))).toEqual([{ creative_id: 'cr_new' }]);
     expect(r).not.toHaveProperty('would_refuse'); // real runs never carry it
   });
 
   it('asset-feed: a refused rebind names the creative it created and how to attach it', async () => {
-    // Meta returns the new creative without the rules the edit carried.
+    // The pre-create check passes (the edit carries the rules), but Meta
+    // returns the new creative without them.
     const calls = editMock({ creative: dcoCreative(), newCreativeRules: [] });
 
     const err = await editCreativeText('ad_1', { headlines: ['New A', 'New B'] }, TOKEN, false).then(
@@ -995,13 +1010,14 @@ describe('editCreativeText', () => {
     expect(json(posts(calls)[0]?.form.asset_feed_spec).bodies).toEqual([{ text: 'Only one' }]);
   });
 
-  it('dry run lists the changed fields, reports no refusal and sends no POST', async () => {
+  it('dry run lists the changed fields, runs the placement-rule check, reports no refusal and sends no POST', async () => {
     const calls = editMock({ creative: dcoCreative() });
 
     const r = await editCreativeText('ad_1', { headlines: ['A', 'B'] }, TOKEN, true);
 
     expect(posts(calls)).toEqual([]);
     expect(r).toMatchObject({ changed_fields: ['headlines'], new_creative_id: '', would_refuse: null });
+    expect(ruleReads(calls)).toEqual(['cr_old']);
   });
 
   /**
@@ -1053,12 +1069,13 @@ describe('editCreativeText', () => {
     expect(posts(calls)).toEqual([]);
   });
 
-  it('dry run of an edit that changes nothing reports no refusal', async () => {
-    editMock({ creative: legacyCreative() });
+  it('dry run of an edit that changes nothing reports no refusal and reads no rules', async () => {
+    const calls = editMock({ creative: legacyCreative(), oldRules: RULES });
 
     const r = await editCreativeText('ad_1', { headlines: [] }, TOKEN, true);
 
     expect(r).toMatchObject({ changed_fields: [], new_creative_id: 'cr_old', would_refuse: null });
+    expect(ruleReads(calls)).toEqual([]);
   });
 
   it('legacy: replaces the headline and keeps link, message, image and CTA', async () => {
@@ -1089,6 +1106,121 @@ describe('editCreativeText', () => {
     expect(posts(calls)).toEqual([]);
     expect(r).toMatchObject({ changed_fields: [], new_creative_id: 'cr_old' });
     expect(r).not.toHaveProperty('would_refuse');
+  });
+});
+
+/**
+ * Like the url_tags update and the lead-form swap (incrementality#30), the text
+ * edit runs the placement-rule check BEFORE it creates the new creative, against
+ * the rules that creative will carry: the current rules for an asset-feed
+ * rebuild, none for a legacy link_data rebuild. A refusal creates nothing, so no
+ * creative is left unattached, and the dry run returns the same refusal.
+ */
+describe('editCreativeText: placement-rule check before the create', () => {
+  const editRefusals: Array<[string, EditWorld, Record<string, string[]>, RegExp]> = [
+    [
+      'legacy rebuild of a creative whose placement rules the link_data rebuild would drop',
+      { creative: legacyCreative(), oldRules: RULES },
+      { headlines: ['New headline'] },
+      /^Refusing to rebind ad ad_1: current creative cr_old has 2 asset_customization_rules.*the new creative this call would create carries none/s,
+    ],
+    [
+      'asset-feed rebuild when the current creative’s placement rules cannot be read',
+      { creative: dcoCreative(), oldRules: new GraphFail('Application does not have permission for this action', 10) },
+      { headlines: ['New A', 'New B'] },
+      /^Refusing to rebind ad ad_1: could not read the placement rules.*does not have permission/s,
+    ],
+    [
+      'legacy rebuild when the current creative’s placement rules cannot be read',
+      { creative: legacyCreative(), oldRules: new GraphFail('Service temporarily unavailable', 2) },
+      { messages: ['New primary text'] },
+      /^Refusing to rebind ad ad_1: could not read the placement rules.*temporarily unavailable/s,
+    ],
+  ];
+
+  it.each(editRefusals)('%s: the real call refuses before creating anything', async (_label, world, edits, refusal) => {
+    const calls = editMock(world);
+
+    const err = await editCreativeText('ad_1', edits, TOKEN, false).then(
+      () => null,
+      (e: unknown) => e as Error,
+    );
+
+    expect(err?.message).toMatch(refusal);
+    expect(err?.message).toMatch(/Nothing was created or changed/);
+    expect(err?.message).not.toMatch(/created by this call/);
+    // No create POST, so no creative is left unattached; no rebind POST either.
+    expect(posts(calls)).toEqual([]);
+    expect(ruleReads(calls)).toEqual(['cr_old']);
+  });
+
+  it.each(editRefusals)('%s: the dry run returns that refusal as would_refuse and sends no POST', async (_label, world, edits) => {
+    editMock(world);
+    const real = await editCreativeText('ad_1', edits, TOKEN, false).then(
+      () => null,
+      (e: unknown) => e as Error,
+    );
+    expect(real?.message).toMatch(/^Refusing to rebind ad ad_1: /);
+
+    const calls = editMock(world);
+    const r = await editCreativeText('ad_1', edits, TOKEN, true);
+
+    expect(r).toMatchObject({ new_creative_id: '', changed_fields: Object.keys(edits), would_refuse: real!.message });
+    expect(posts(calls)).toEqual([]);
+  });
+
+  it('force=true skips the label check only: the placement-rule check still refuses before the create', async () => {
+    // A label count change force=true allows, on an ad whose rules can't be read.
+    const labelRules = [{ customization_spec: { publisher_platforms: ['facebook'] }, body_label: { name: 'b1' } }];
+    const world: EditWorld = {
+      creative: dcoCreative(labelRules),
+      oldRules: new GraphFail('Service temporarily unavailable', 2),
+    };
+    const calls = editMock(world);
+
+    const err = await editCreativeText('ad_1', { messages: ['Only one'] }, TOKEN, false, true).then(
+      () => null,
+      (e: unknown) => e as Error,
+    );
+
+    expect(err?.message).toMatch(/^Refusing to rebind ad ad_1: could not read the placement rules/);
+    // The refusal says what force=true on this tool does and doesn't cover.
+    expect(err?.message).toMatch(/force=true on this tool skips the label check only/);
+    expect(posts(calls)).toEqual([]);
+
+    const dry = await editCreativeText('ad_1', { messages: ['Only one'] }, TOKEN, true, true);
+    expect(dry.would_refuse).toBe(err?.message);
+  });
+
+  it('a label refusal comes first: neither the real call nor the dry run reads the placement rules', async () => {
+    const labelRules = [{ customization_spec: { publisher_platforms: ['facebook'] }, body_label: { name: 'b1' } }];
+    const calls = editMock({ creative: dcoCreative(labelRules), oldRules: new GraphFail('would refuse too', 2) });
+
+    const err = await editCreativeText('ad_1', { messages: ['Only one'] }, TOKEN, false).then(
+      () => null,
+      (e: unknown) => e as Error,
+    );
+    const dry = await editCreativeText('ad_1', { messages: ['Only one'] }, TOKEN, true);
+
+    expect(err?.message).toMatch(/^Refusing to edit messages on ad ad_1: /);
+    expect(dry.would_refuse).toBe(err?.message);
+    expect(ruleReads(calls)).toEqual([]);
+    expect(posts(calls)).toEqual([]);
+  });
+
+  it('legacy: an ad with no placement rules is checked before the create, then created and rebound', async () => {
+    const calls = editMock({ creative: legacyCreative() });
+
+    const r = await editCreativeText('ad_1', { headlines: ['New headline'] }, TOKEN, false);
+
+    const [create, rebind, ...rest] = posts(calls);
+    expect(rest).toEqual([]);
+    expect(create?.path).toBe('act_111/adcreatives');
+    expect(rebind?.path).toBe('ad_1');
+    const firstRuleRead = calls.findIndex((c) => c.query.fields === RULE_READ);
+    expect(calls[firstRuleRead]?.path).toBe('cr_old');
+    expect(firstRuleRead).toBeLessThan(calls.indexOf(create!));
+    expect(r).toMatchObject({ mode: 'object_story_spec', new_creative_id: 'cr_new' });
   });
 });
 

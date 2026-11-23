@@ -442,6 +442,57 @@ describe('create-then-rebind tools refuse before the create, and dry_run reports
       fetchMock.mockImplementation(restore);
     }
   });
+
+  it('meta_ads_edit_creative_text: the real call refuses with no POST, and the dry run returns that refusal', async () => {
+    vi.stubEnv('META_ADS_MCP_WRITE', 'true');
+    // A legacy link_data creative: the rebuild has nowhere to put the placement rule.
+    const restore = fetchMock.getMockImplementation()!;
+    fetchMock.mockImplementation(async (input: string | URL | Request, init?: RequestInit) => {
+      const u = new URL(String(input));
+      fetchCalls.push({ url: u.toString(), method: init?.method ?? 'GET', body: new URLSearchParams(init?.body ? String(init.body) : '') });
+      const id = u.pathname.split('/').pop();
+      const body =
+        id === AD
+          ? {
+              id: AD,
+              name: 'Call-site ad',
+              account_id: ACCOUNT.replace(/^act_/, ''),
+              creative: {
+                id: OLD_CREATIVE,
+                object_story_spec: { page_id: PAGE, link_data: { link: 'https://example.com/', message: 'Body', name: 'Headline' } },
+              },
+            }
+          : id === OLD_CREATIVE
+            ? { id, asset_feed_spec: { asset_customization_rules: [PLACEMENT_RULE] } }
+            : { id };
+      return new Response(JSON.stringify(body), { status: 200, headers: { 'content-type': 'application/json' } });
+    });
+    try {
+      const args = { ad_id: AD, headlines: ['New headline'] };
+      const dry = await client.callTool({ name: 'meta_ads_edit_creative_text', arguments: { ...args, dry_run: true } });
+      const real = await client.callTool({ name: 'meta_ads_edit_creative_text', arguments: args });
+
+      expect(dry.isError ?? false).toBe(false);
+      const out = JSON.parse(textOf(dry));
+      expect(Object.keys(out).sort()).toEqual([
+        'ad_id',
+        'ad_name',
+        'changed_fields',
+        'customization_rules_preserved',
+        'mode',
+        'new_creative_id',
+        'previous_creative_id',
+        'would_refuse',
+      ]);
+      expect(out).toMatchObject({ ad_id: AD, previous_creative_id: OLD_CREATIVE, new_creative_id: '', changed_fields: ['headlines'] });
+      expect(out.would_refuse).toMatch(/^Refusing to rebind ad .*Nothing was created or changed/s);
+      expect(real.isError).toBe(true);
+      expect(textOf(real)).toContain(out.would_refuse);
+      expect(fetchCalls.filter((c) => c.method === 'POST')).toEqual([]);
+    } finally {
+      fetchMock.mockImplementation(restore);
+    }
+  });
 });
 
 describe('meta_ads_edit_creative_text dry_run at the call site (writes enabled)', () => {

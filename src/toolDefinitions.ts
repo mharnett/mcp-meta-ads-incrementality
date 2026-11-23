@@ -102,7 +102,8 @@ const TOOL_UPDATE_AD_URL_TAGS = {
     'Mechanism: creates a new creative on the same Page post with the new url_tags, then ' +
     'rebinds the ad to it, keeping the ad_id stable. SAFETY: runs the same placement-rule ' +
     'check as meta_ads_rebind_ad_creative and refuses when the ad\'s per-placement image rules ' +
-    '(asset_customization_rules) would be dropped or can\'t be read. The check runs before the ' +
+    '(asset_customization_rules) can\'t be read, or when the ad has any: whether a creative ' +
+    'built from the Page post carries them over is unverified. The check runs before the ' +
     'new creative is created, so a refused call creates and changes nothing. Pass dry_run=true ' +
     'to preview: it runs the same check without writing and returns would_refuse, the refusal ' +
     'the real call would give, or null if it would go ahead. ' +
@@ -637,7 +638,10 @@ const TOOL_EDIT_CREATIVE_TEXT = {
     'per-text labels (body_label/title_label/description_label) and the new text count ' +
     'differs from the existing count — pass force=true to override. Multi-variant ads ' +
     '(asset_feed_spec) accept up to 5 entries per field; legacy single-variant ads ' +
-    '(object_story_spec) accept ≤1 entry per field.',
+    '(object_story_spec) accept ≤1 entry per field. Before creating the new creative it also ' +
+    'runs the placement-rule check of meta_ads_rebind_ad_creative, and refuses when the ' +
+    'rebuild would drop the ad\'s placement rules or they can\'t be read, so a refused call ' +
+    'creates and changes nothing. force=true does not skip that check.',
   inputSchema: {
     type: 'object',
     properties: {
@@ -660,12 +664,15 @@ const TOOL_EDIT_CREATIVE_TEXT = {
       dry_run: {
         type: 'boolean',
         description:
-          'If true, run the label-orphaning check and return the diff without writing: ' +
-          'would_refuse is the refusal the real call would give, or null if it would go ahead.',
+          'If true, run the label-orphaning and placement-rule checks and return the diff ' +
+          'without writing: would_refuse is the refusal the real call would give, or null if it ' +
+          'would go ahead.',
       },
       force: {
         type: 'boolean',
-        description: 'Bypass the label-orphaning safety check (only for DCO-style ads with labeled text).',
+        description:
+          'Bypass the label-orphaning safety check (only for DCO-style ads with labeled text). ' +
+          'Does not bypass the placement-rule check.',
       },
     },
     required: ['ad_id'],
