@@ -159,10 +159,12 @@ function textOf(result: unknown): string {
 }
 
 let client: Client;
+let sigpipeListenersBeforeImport = 0;
 
 beforeAll(async () => {
   vi.stubGlobal('fetch', fetchMock);
   vi.stubEnv('META_ADS_MCP_WRITE', undefined);
+  sigpipeListenersBeforeImport = process.listenerCount('SIGPIPE');
   await import('./index.js');
   client = new Client({ name: 'call-site-test', version: '0.0.0' }, { capabilities: {} });
   await client.connect(h.clientTransport);
@@ -556,5 +558,17 @@ describe('meta_ads_edit_creative_text dry_run at the call site (writes enabled)'
     } finally {
       fetchMock.mockImplementation(restore);
     }
+  });
+});
+
+describe('index.ts process handlers', () => {
+  // Writing to a pipe the client has closed raises SIGPIPE. The sibling
+  // servers register a no-op handler for it, and the shared harness's
+  // graceful-shutdown suite requires one. This checks the real entrypoint
+  // registers it when it starts, and that the handler does not throw.
+  it('registers a SIGPIPE listener at startup', () => {
+    const added = process.listeners('SIGPIPE').slice(sigpipeListenersBeforeImport);
+    expect(added.length).toBeGreaterThan(0);
+    for (const listener of added) expect(() => (listener as () => void)()).not.toThrow();
   });
 });
