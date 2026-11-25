@@ -310,6 +310,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   }
 });
 
+process.on('SIGPIPE', () => {
+  // Client disconnected -- expected during shutdown
+});
+
 const transport = new StdioServerTransport();
 await server.connect(transport);
 process.stderr.write(`[ready] ${pkg.name} v${pkg.version} listening on stdio\n`);
