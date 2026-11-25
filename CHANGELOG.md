@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.4.3](https://github.com/mharnett/mcp-meta-ads-incrementality/compare/mcp-meta-ads-incrementality-v0.4.2...mcp-meta-ads-incrementality-v0.4.3) (2026-11-25)
+
+
+### Bug Fixes
+
+* edit_creative_text checks placement rules before it creates; add mcpName for the MCP registry ([#31](https://github.com/mharnett/mcp-meta-ads-incrementality/issues/31)) ([0f97448](https://github.com/mharnett/mcp-meta-ads-incrementality/commit/0f97448721118346ac73d91e040abdb8ce501e4d))
+* url_tags and lead-form swaps check placement rules before creating the creative ([#30](https://github.com/mharnett/mcp-meta-ads-incrementality/issues/30)) ([570daf9](https://github.com/mharnett/mcp-meta-ads-incrementality/commit/570daf9c029f9511d229ebfe85b52c6ce78f5969))
+* url_tags and lead-form swaps rebind through the placement-rule check ([#28](https://github.com/mharnett/mcp-meta-ads-incrementality/issues/28)) ([a2b3798](https://github.com/mharnett/mcp-meta-ads-incrementality/commit/a2b37981d71f4d8d059433ee20989da7eeecf7ba))
+
 ## [0.4.2](https://github.com/mharnett/mcp-meta-ads-incrementality/compare/mcp-meta-ads-incrementality-v0.4.1...mcp-meta-ads-incrementality-v0.4.2) (2026-11-22)
 
 
